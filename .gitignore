@@ -1,0 +1,27 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# --- 仮想環境 ---
+venv/
+.venv/
+env/
+
+# --- ログ・実行時生成ファイル（口座情報を含むため厳禁） ---
+*.log
+mt5_autotrade.log
+
+# --- 認証情報を分けた場合（任意） ---
+config_local.py
+
+# --- エディタ / OS ---
+.idea/
+.vscode/
+*.swp
+.DS_Store

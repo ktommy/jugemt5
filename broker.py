@@ -110,6 +110,12 @@ class MT5Broker:
                 return mode
         return mt5.ORDER_FILLING_IOC
 
+    def _round_price(self, symbol: str, price: float) -> float:
+        """SL/TP などの価格を銘柄の桁数 (digits) に丸める。"""
+        info = mt5.symbol_info(symbol)
+        digits = info.digits if info else 2
+        return round(price, digits)
+
     def _send(self, request: dict):
         result = mt5.order_send(request)
         if result is None:
@@ -126,7 +132,7 @@ class MT5Broker:
         )
         return result
 
-    def market_buy(self, symbol: str, lot: float):
+    def market_buy(self, symbol: str, lot: float, sl: float = None, tp: float = None):
         tick = self.get_tick(symbol)
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -140,9 +146,13 @@ class MT5Broker:
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": self._filling(symbol),
         }
+        if sl is not None:
+            request["sl"] = self._round_price(symbol, sl)
+        if tp is not None:
+            request["tp"] = self._round_price(symbol, tp)
         return self._send(request)
 
-    def market_sell(self, symbol: str, lot: float):
+    def market_sell(self, symbol: str, lot: float, sl: float = None, tp: float = None):
         tick = self.get_tick(symbol)
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -156,6 +166,10 @@ class MT5Broker:
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": self._filling(symbol),
         }
+        if sl is not None:
+            request["sl"] = self._round_price(symbol, sl)
+        if tp is not None:
+            request["tp"] = self._round_price(symbol, tp)
         return self._send(request)
 
     def close_position(self, position):

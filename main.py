@@ -77,8 +77,9 @@ def main() -> None:
 
     # 戦略を差し替える場合はここを変更する
     strategy = EMACrossStrategy(
-        fast=20, mid=75, slow=200,
-        tp_pct=0.005, sl_pct=0.003,
+        fast=config.ema_fast, mid=config.ema_mid, slow=config.ema_slow,
+        tp_pct=config.ema_tp_pct, sl_pct=config.ema_sl_pct,
+        trend_filter=config.ema_trend_filter,
     )
 
     broker = MT5Broker(config)

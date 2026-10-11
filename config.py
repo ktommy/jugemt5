@@ -43,6 +43,14 @@ class Config:
     magic: int = 20261010        # このボットの注文を識別するマジックナンバー
     deviation: int = 20          # 許容スリッページ（ポイント）
 
+    # --- 戦略（EMA 20/75/200 クロス） ---
+    ema_fast: int = 20            # 短期 EMA
+    ema_mid: int = 75             # 中期 EMA
+    ema_slow: int = 200           # 長期 EMA（トレンドフィルタ）
+    ema_trend_filter: bool = True  # EMA200 で逆トレンドのクロスを抑止
+    ema_tp_pct: float = 0.005     # +0.5% で利食い
+    ema_sl_pct: float = 0.003     # -0.3% で損切り
+
     # --- メインループ ---
     poll_interval: float = 5.0   # 価格確認間隔（秒）
 

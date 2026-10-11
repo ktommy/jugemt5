@@ -7,7 +7,7 @@ MetaTrader5 公式 Python API を使った、差し替え可能な自動売買�
 
 - 一定間隔でローソク足を取得し、**新しい確定足が発生したときだけ**戦略を評価して発注します。
 - 発注は `magic` 番号で管理し、**このボットが発注したポジションのみ**を操作します（手動・他EAのポジションには触れません）。
-- 現在はサンプル戦略「**RSI 逆張り + TP/SL**」が組み込まれています。
+- 現在は「**EMA 20/75/200 クロス**」戦略が組み込まれています。
 
 ## 前提
 
@@ -19,10 +19,11 @@ MetaTrader5 公式 Python API を使った、差し替え可能な自動売買�
 
 | ファイル | 役割 |
 |---|---|
-| `config.py` | 設定（接続・銘柄・ロット・時間足など） |
-| `strategy.py` | 戦略インターフェース + サンプル戦略（RSI逆張り・移動平均クロス） |
+| `config.py` | 設定（接続・銘柄・ロット・時間足・戦略パラメータなど） |
+| `strategy.py` | 戦略インターフェース + 戦略（EMA20/75/200クロス・RSI逆張り・MAクロス） |
 | `broker.py` | MT5 接続・レート取得・発注・決済・ポジション管理・起動時自己診断 |
 | `main.py` | 監視ループ（確定足ごとに戦略評価 → 発注） |
+| `test_strategy.py` | 戦略のユニットテスト（合成データで検証、MT5 不要） |
 | `requirements.txt` | 依存関係 |
 | `README.md` | 本ドキュメント |
 
@@ -63,20 +64,30 @@ MT5 の Python API は、**端末がローカルに保持している履歴デ�
 | `lot` | `0.01` | 固定ロット |
 | `magic` | `20261010` | このボットの注文を識別する番号（他EAと重複しない値にする） |
 | `deviation` | `20` | 許容スリッページ（ポイント） |
+| `ema_fast` | `20` | 短期 EMA の期間 |
+| `ema_mid` | `75` | 中期 EMA の期間 |
+| `ema_slow` | `200` | 長期 EMA の期間（トレンドフィルタ） |
+| `ema_trend_filter` | `True` | EMA200 で逆トレンドのクロスを抑止するか |
+| `ema_tp_pct` | `0.005` | 利食い幅（エントリー価格比、`0` で無効） |
+| `ema_sl_pct` | `0.003` | 損切り幅（エントリー価格比、`0` で無効） |
 | `poll_interval` | `5.0` | 価格確認間隔（秒） |
 | `log_file` | `"mt5_autotrade.log"` | ログ出力先ファイル |
 
-## 現在の戦略（RSI 逆張り + TP/SL）
+## 現在の戦略（EMA 20/75/200 クロス + TP/SL）
 
-`strategy.py` の `RSIReversalStrategy` が有効です。確定足の終値から RSI(14) を計算し、
-売られすぎ／買われすぎからの反転を狙う逆張りで、**TP/SL（利食い・損切り）を注文時に設定**します。
+`strategy.py` の `EMACrossStrategy` が有効です。確定足から EMA20・EMA75・EMA200 を計算し、
+**EMA20 と EMA75 のクロス**を売買シグナルに、**EMA200 を長期トレンドフィルタ**に使うトレンドフォローです。
+TP/SL（利食い・損切り）を注文時に設定します。
 
 | 条件 | シグナル | 動作 |
 |---|---|---|
-| RSI が売られすぎ(30)を下から上に抜けて反転 | `BUY` | 買い |
-| RSI が買われすぎ(70)を上から下に抜けて反転 | `SELL` | 売り |
-| 保有中に RSI が中立水準(50)へ戻る | `CLOSE` | 決済 |
+| EMA20 が EMA75 を下→上に抜ける（かつ価格 > EMA200） | `BUY` | 買い |
+| EMA20 が EMA75 を上→下に抜ける（かつ価格 < EMA200） | `SELL` | 売り |
+| トレンドに逆らうクロス（価格が EMA200 の反対側） | `HOLD` | 見送り |
 | それ以外 | `HOLD` | 何もしない |
+
+クロス判定は直近2本の確定足で行います。EMA200 フィルタは長期トレンドに逆らうクロスを無視します
+（`config.py` の `ema_trend_filter = False` で無効化できます）。
 
 ### 発注時の挙動
 
@@ -84,7 +95,7 @@ MT5 の Python API は、**端末がローカルに保持している履歴デ�
 - 逆向きポジションを保有中に逆向きシグナルが出た場合は、決済してから新規（＝ドテン）。
 - 同じ向きのポジションを保有中は追加発注しません（増玉なし）。
 
-> RSI の閾値・期間・TP/SL 幅は `RSIReversalStrategy` の引数で変更できます。
+> EMA の期間・トレンドフィルタ・TP/SL 幅は `config.py` の `ema_*` 項目で変更できます。
 > TP/SL はブローカーが定める最小ストップ距離（`stops_level`）より十分離す必要があります（近すぎるとリジェクトされます）。
 
 ## 実行
@@ -107,11 +118,27 @@ MT5 の Python API は、**端末がローカルに保持している履歴デ�
 MT5 端末で BTCUSD の M5 チャートを開いてください。
 ```
 
+## テスト
+
+戦略のシグナル判定ロジックは、MT5 への実接続なしで合成データから検証できます（`test_strategy.py`）。
+
+```powershell
+# 詳細表示（各テスト名と OK/FAIL が出る）
+.\venv\Scripts\python.exe -m unittest test_strategy -v
+
+# 結果だけ表示
+.\venv\Scripts\python.exe -m unittest test_strategy
+```
+
+`unittest` は標準ライブラリなので追加インストールは不要です（実行には `pandas` / `numpy` が必要で、`pip install -r requirements.txt` で揃います）。
+
+検証内容: EMA20×EMA75 のクロスで BUY/SELL が出ること、EMA200 フィルタが逆トレンドのクロスを抑止すること、履歴不足時や横ばい時に HOLD になること、など。
+
 ## 戦略の差し替え方
 
 `strategy.py` に `Strategy` を継承したクラスを作り、`on_bar(df, pos_dir)` で
 `Signal.BUY` / `Signal.SELL` / `Signal.CLOSE` / `Signal.HOLD` を返します。
-`main.py` の `strategy = RSIReversalStrategy(...)` の行を変更するだけです。
+`main.py` の `strategy = ...` の行を変更するだけです。
 
 ```python
 from strategy import Strategy, Signal

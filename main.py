@@ -9,7 +9,7 @@ import time
 import MetaTrader5 as mt5
 
 from config import Config
-from strategy import Signal, MACrossStrategy, RSIReversalStrategy
+from strategy import Signal, EMACrossStrategy
 from broker import MT5Broker
 
 
@@ -75,9 +75,9 @@ def main() -> None:
     config = Config()
     setup_logging(config.log_file)
 
-    # 戦略を差し替える場合はここを変更する（例: strategy = MACrossStrategy()）
-    strategy = RSIReversalStrategy(
-        period=14, oversold=30, overbought=70, exit_level=50,
+    # 戦略を差し替える場合はここを変更する
+    strategy = EMACrossStrategy(
+        fast=20, mid=75, slow=200,
         tp_pct=0.005, sl_pct=0.003,
     )
 
@@ -103,7 +103,11 @@ def main() -> None:
 
     try:
         while True:
-            df = broker.get_rates(config.symbol, count=200)
+            # EMA(slow) の収束に必要な本数を戦略から取得（無ければ従来どおり 200）
+            df = broker.get_rates(
+                config.symbol,
+                count=max(200, getattr(strategy, "min_history", 200) + 2),
+            )
             if df is None:
                 time.sleep(config.poll_interval)
                 continue

@@ -128,3 +128,63 @@ class RSIReversalStrategy(Strategy):
             return Signal.SELL
 
         return Signal.HOLD
+
+
+class EMACrossStrategy(Strategy):
+    """EMA 20/75/200 トレンドフォロー戦略。
+
+    - EMA20 が EMA75 を下→上に抜けたら BUY、上→下に抜けたら SELL
+    - EMA200（価格との位置）で長期トレンドを判定し、トレンドに逆らうクロスを無視
+    - 決済は逆シグナルでの反転（main.py 側で処理）＋ TP/SL 併用
+
+    tp_pct / sl_pct はエントリー価格に対する利食い・損切り幅（比率）。
+    0 を指定するとその側の TP/SL を無効にする（main.py が参照する）。
+    trend_filter=False にすると EMA200 フィルタなしの単純クロスになる。
+    """
+
+    name = "ema_cross"
+
+    def __init__(
+        self,
+        fast: int = 20,
+        mid: int = 75,
+        slow: int = 200,
+        tp_pct: float = 0.005,   # +0.5% で利食い
+        sl_pct: float = 0.003,   # -0.3% で損切り
+        trend_filter: bool = True,
+    ):
+        self.fast = fast
+        self.mid = mid
+        self.slow = slow
+        self.tp_pct = tp_pct
+        self.sl_pct = sl_pct
+        self.trend_filter = trend_filter
+        # EMA(slow) の収束に十分な履歴本数。main.py が参照して取得本数を決める。
+        self.min_history = slow + 100
+
+    def on_bar(self, df: pd.DataFrame, pos_dir: int = 0) -> Signal:
+        if len(df) < self.slow + 2:
+            return Signal.HOLD
+
+        close = df["close"]
+        ema_fast = close.ewm(span=self.fast, adjust=False).mean()
+        ema_mid = close.ewm(span=self.mid, adjust=False).mean()
+        ema_slow = close.ewm(span=self.slow, adjust=False).mean()
+
+        # 最新の2本の確定足でクロスを判定
+        prev_diff = ema_fast.iloc[-2] - ema_mid.iloc[-2]
+        cur_diff = ema_fast.iloc[-1] - ema_mid.iloc[-1]
+
+        # 長期トレンド: 価格が EMA200 の上か下か
+        price = close.iloc[-1]
+        uptrend = price > ema_slow.iloc[-1]
+        downtrend = price < ema_slow.iloc[-1]
+
+        if prev_diff <= 0 < cur_diff:                    # ゴールデンクロス
+            if not self.trend_filter or uptrend:
+                return Signal.BUY
+        if prev_diff >= 0 > cur_diff:                    # デッドクロス
+            if not self.trend_filter or downtrend:
+                return Signal.SELL
+
+        return Signal.HOLD

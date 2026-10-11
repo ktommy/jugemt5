@@ -3,7 +3,16 @@
   "password": "",
   "server": "",
 
-  "symbol": "BTCUSD",
+  "symbols": [
+    "BTCUSD",
+    "EURUSD",
+    "USDJPY",
+    "GBPUSD",
+    "AUDUSD",
+    "USDCHF",
+    "USDCAD",
+    "NZDUSD"
+  ],
   "timeframe": "M5",
 
   "lot": 0.01,

@@ -4,7 +4,7 @@
 本番運用では Config を直接書き換えるか、main.py 側で上書きして使う。
 """
 import json
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 
 
 def timeframe_to_int(name: str) -> int:
@@ -35,8 +35,13 @@ class Config:
     password: str = ""
     server: str = ""
 
-    # --- 取引対象 ---
-    symbol: str = "BTCUSD"
+    # --- 取引対象（候補リスト） ---
+    # ホワイトリスト方式: この中からシグナルを出した銘柄を選び、常に 1 銘柄だけ取引する。
+    # 銘柄名はブローカーにより異なる。存在しない銘柄は起動時にスキップされる。
+    symbols: list = field(default_factory=lambda: [
+        "BTCUSD", "EURUSD", "USDJPY", "GBPUSD",
+        "AUDUSD", "USDCHF", "USDCAD", "NZDUSD",
+    ])
     timeframe: str = "M5"
 
     # --- 注文 ---

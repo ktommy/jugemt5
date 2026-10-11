@@ -89,6 +89,20 @@ class MT5Broker:
                 return p
         return None
 
+    def get_any_position(self):
+        """magic 一致の保有ポジションを全銘柄から 1 件返す。無ければ None。
+
+        単一銘柄ローテーションで、起動時に「どの銘柄を保有しているか」を
+        引き継ぐために使う。
+        """
+        positions = mt5.positions_get()
+        if positions is None:
+            return None
+        for p in positions:
+            if p.magic == self.config.magic:
+                return p
+        return None
+
     # ---------- 注文 ----------
     def normalize_lot(self, symbol: str, lot: float) -> float:
         """lot を銘柄の volume_step の倍数・min/max 範囲に丸める。"""

@@ -1,7 +1,7 @@
 """エントリポイント。
 
-一定間隔でローソク足を取得し、新しい確定足が発生したタイミングで
-戦略 on_bar を評価して売買を実行する。
+候補銘柄（config の symbols）を一定間隔で走査し、新しい確定足のタイミングで
+「戦略がシグナルを出した銘柄」を選び、その銘柄だけを取引する（単一銘柄ローテーション）。
 """
 import logging
 import time
@@ -12,6 +12,7 @@ from config import load_config
 from strategy import Signal, EMACrossStrategy
 from range_strategy import RSIRangeStrategy
 from regime import Regime, detect_regime
+from selector import scan_signals
 from broker import MT5Broker
 
 
@@ -73,6 +74,13 @@ def act_on_signal(broker: MT5Broker, symbol: str, lot: float,
     return broker.get_position(symbol)
 
 
+def _pos_dir(position) -> int:
+    """ポジションから方向を返す（+1=買い / -1=売り / 0=無し）。"""
+    if position is None:
+        return 0
+    return 1 if position.type == mt5.POSITION_TYPE_BUY else -1
+
+
 def main() -> None:
     config = load_config()
     setup_logging(config.log_file)
@@ -93,100 +101,146 @@ def main() -> None:
     broker = MT5Broker(config)
     broker.connect()
 
-    # 対象銘柄をマーケットウォッチに追加（価格流動・発注に必要）
-    mt5.symbol_select(config.symbol, True)
+    # 候補銘柄をすべてマーケットウォッチに追加（履歴同期・価格取得に必要）
+    for symbol in config.symbols:
+        mt5.symbol_select(symbol, True)
 
-    # 起動時自己診断: 履歴データが無ければ案内して終了する
-    try:
-        broker.ensure_history(config.symbol)
-    except RuntimeError as exc:
-        logging.error(exc)
+    # 起動時自己診断: 履歴が取得できる銘柄だけを候補に残す
+    symbols = []
+    for symbol in config.symbols:
+        try:
+            broker.ensure_history(symbol)
+            symbols.append(symbol)
+        except RuntimeError as exc:
+            logging.error(exc)
+    if not symbols:
+        logging.error(
+            "候補銘柄の履歴が1件も取得できませんでした。"
+            "MT5 端末で該当チャートを開いてください。"
+        )
         broker.disconnect()
         return
 
+    # 候補全銘柄で統一して取得する履歴本数（戦略が必要とする本数を満たす）
+    count = max(
+        200,
+        getattr(trend_strategy, "min_history", 200) + 2,
+        getattr(range_strategy, "min_history", 200) + 2,
+    )
+
+    def get_rates(symbol):
+        return broker.get_rates(symbol, count)
+
+    # 起動時に保有中のポジションがあれば引き継ぐ（レジーム不明なので直近barで採用）
+    existing = broker.get_any_position()
+    pos_symbol = existing.symbol if existing is not None else None
+    pos_regime = None           # 現在のポジションを建てたレジーム（未知/無しなら None）
+    holding_regime = None       # 保有中の銘柄で最後に観測したレジーム（ログ用）
+
     last_bar_time = None
-    last_regime = None
-    pos_regime = None  # 現在のポジションを建てたレジーム（未知/無しなら None）
+
     logging.info(
-        "監視開始: symbol=%s timeframe=%s trend=%s range=%s lot=%s",
-        config.symbol, config.timeframe,
+        "監視開始: symbols=%s timeframe=%s trend=%s range=%s lot=%s",
+        symbols, config.timeframe,
         trend_strategy.name, range_strategy.name, config.lot,
     )
 
     try:
         while True:
-            # 各戦略が必要とする履歴本数を満たすよう取得する
-            df = broker.get_rates(
-                config.symbol,
-                count=max(
-                    200,
-                    getattr(trend_strategy, "min_history", 200) + 2,
-                    getattr(range_strategy, "min_history", 200) + 2,
-                ),
-            )
-            if df is None:
+            # 参照銘柄（保有中はその銘柄、無ければ先頭）の直近足で確定バーを検知
+            ref = pos_symbol if pos_symbol is not None else symbols[0]
+            ref_df = broker.get_rates(ref, 3)
+            if ref_df is None or len(ref_df) < 2:
                 time.sleep(config.poll_interval)
                 continue
-
-            # 末尾は形成中の未確定足なので除外し、確定足のみで判定する
-            if len(df) < 2:
+            completed_ref = ref_df.iloc[:-1]
+            bar_time = int(completed_ref["time"].iloc[-1].timestamp())
+            if bar_time == last_bar_time:
                 time.sleep(config.poll_interval)
                 continue
-            completed = df.iloc[:-1]
-            bar_time = int(completed["time"].iloc[-1].timestamp())
+            last_bar_time = bar_time
 
-            # 新しい確定足が発生したときだけ戦略を評価
-            if bar_time != last_bar_time:
-                last_bar_time = bar_time
+            if pos_symbol is None:
+                # --- フラット: 全候補を走査し、最良のシグナルで新規エントリー ---
+                candidates = scan_signals(
+                    symbols, trend_strategy, range_strategy, get_rates,
+                    config.adx_period, config.adx_threshold,
+                )
+                for r in candidates:
+                    logging.info(
+                        "候補: %s %s score=%.1f（%s）",
+                        r.symbol, r.signal.value, r.score, r.regime.value,
+                    )
+                if not candidates:
+                    time.sleep(config.poll_interval)
+                    continue
 
-                # 相場判定（トレンド / レンジ）と使用戦略の選択
+                best = candidates[0]
+                logging.info(
+                    "選択: %s %s（regime=%s）",
+                    best.symbol, best.signal.value, best.regime.value,
+                )
+                act_on_signal(
+                    broker, best.symbol, config.lot, best.signal, None,
+                    sl_pct=getattr(best.strategy, "sl_pct", None),
+                    tp_pct=getattr(best.strategy, "tp_pct", None),
+                )
+
+                new_position = broker.get_position(best.symbol)
+                if new_position is not None:
+                    pos_symbol = best.symbol
+                    pos_regime = best.regime
+                    holding_regime = best.regime
+            else:
+                # --- 保有中: その銘柄だけ評価（他銘柄へは乗り換えない） ---
+                df = get_rates(pos_symbol)
+                if df is None or len(df) < 2:
+                    time.sleep(config.poll_interval)
+                    continue
+                completed = df.iloc[:-1]
+
+                position = broker.get_position(pos_symbol)
+                if position is None:
+                    logging.info("ポジション消滅: %s（TP/SL 到達など）", pos_symbol)
+                    pos_symbol = None
+                    pos_regime = None
+                    holding_regime = None
+                    time.sleep(config.poll_interval)
+                    continue
+
                 regime = detect_regime(
                     completed, config.adx_period, config.adx_threshold
                 )
+                if regime != holding_regime:
+                    holding_regime = regime
+                    logging.info("相場判定: %s -> %s", pos_symbol, regime.value)
                 active = trend_strategy if regime == Regime.TREND else range_strategy
-                if regime != last_regime:
-                    last_regime = regime
-                    logging.info(
-                        "相場判定: %s（%s）",
-                        regime.value, completed["time"].iloc[-1],
-                    )
 
-                position = broker.get_position(config.symbol)
-                pos_dir = 0 if position is None else (
-                    1 if position.type == mt5.POSITION_TYPE_BUY else -1
-                )
-
-                # 保有継続: 旧レジームで建てたポジションは TP/SL に委ね、
-                # 新レジームのシグナルでは反転しない
-                if (
-                    position is not None
-                    and pos_regime is not None
-                    and pos_regime != regime
-                ):
+                # 旧レジーム保有継続: レジームが変わったら TP/SL に委ね、反転しない
+                if pos_regime is not None and pos_regime != regime:
                     signal = Signal.HOLD
                 else:
-                    signal = active.on_bar(completed, pos_dir)
+                    signal = active.on_bar(completed, _pos_dir(position))
 
                 if signal != Signal.HOLD:
                     logging.info(
-                        "シグナル=%s (%s) 戦略=%s 保有=%s",
-                        signal.value, completed["time"].iloc[-1],
-                        active.name, "あり" if position else "なし",
+                        "シグナル=%s（%s）戦略=%s（%s）",
+                        signal.value, pos_symbol, active.name,
+                        completed["time"].iloc[-1],
                     )
                 act_on_signal(
-                    broker, config.symbol, config.lot, signal, position,
+                    broker, pos_symbol, config.lot, signal, position,
                     sl_pct=getattr(active, "sl_pct", None),
                     tp_pct=getattr(active, "tp_pct", None),
                 )
 
-                # ポジションの所有レジームを更新
-                new_position = broker.get_position(config.symbol)
+                new_position = broker.get_position(pos_symbol)
                 if new_position is None:
+                    pos_symbol = None
                     pos_regime = None
-                elif position is None and new_position is not None:
-                    pos_regime = regime           # 新規エントリーを建てたレジーム
+                    holding_regime = None
                 elif pos_regime is None:
-                    pos_regime = regime           # 起動時の既存ポジションを採用
+                    pos_regime = regime  # 起動時の既存ポジションを採用
 
             time.sleep(config.poll_interval)
     except KeyboardInterrupt:

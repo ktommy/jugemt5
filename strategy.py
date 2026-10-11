@@ -31,6 +31,32 @@ def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return rsi.fillna(50.0)
 
 
+def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Wilder の ADX（平均方向性指数）を計算する。
+
+    +DM / -DM / TR(ATR) を指数平滑（alpha=1/period）で平均し、
+    +DI / -DI → DX → ADX の順に求める。方向性の無い横ばいでは 0 に近づく。
+    """
+    high, low, close = df["high"], df["low"], df["close"]
+    up = high.diff()
+    down = -low.diff()
+
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+
+    tr = pd.concat(
+        [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    atr = tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr
+
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    return dx.ewm(alpha=1 / period, min_periods=period, adjust=False).mean().fillna(0.0)
+
+
 class Strategy(ABC):
     """全戦略が実装すべきインターフェース。
 

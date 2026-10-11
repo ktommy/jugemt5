@@ -51,6 +51,17 @@ class Config:
     ema_tp_pct: float = 0.005     # +0.5% で利食い
     ema_sl_pct: float = 0.003     # -0.3% で損切り
 
+    # --- レジーム判定（トレンド / レンジ） ---
+    adx_period: int = 14           # ADX の期間
+    adx_threshold: float = 25.0    # これ未満をレンジ、以上をトレンドとみなす
+
+    # --- レンジ相場戦略（RSI 逆張り + ADX フィルタ） ---
+    rsi_period: int = 14           # RSI の期間
+    rsi_oversold: float = 30.0     # 売られすぎ（これ未満から反転で BUY）
+    rsi_overbought: float = 70.0   # 買われすぎ（これ超えから反転で SELL）
+    range_tp_pct: float = 0.005    # +0.5% で利食い
+    range_sl_pct: float = 0.003    # -0.3% で損切り
+
     # --- メインループ ---
     poll_interval: float = 5.0   # 価格確認間隔（秒）
 

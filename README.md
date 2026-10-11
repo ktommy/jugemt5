@@ -7,7 +7,7 @@ MetaTrader5 公式 Python API を使った、差し替え可能な自動売買�
 
 - 一定間隔でローソク足を取得し、**新しい確定足が発生したときだけ**戦略を評価して発注します。
 - 発注は `magic` 番号で管理し、**このボットが発注したポジションのみ**を操作します（手動・他EAのポジションには触れません）。
-- 現在は「**EMA 20/75/200 クロス**」戦略が組み込まれています。
+- 現在は**トレンド／レンジを見分けて切り替える2戦略（EMAクロス／RSI逆張り）**が組み込まれています。
 
 ## 前提
 
@@ -20,10 +20,13 @@ MetaTrader5 公式 Python API を使った、差し替え可能な自動売買�
 | ファイル | 役割 |
 |---|---|
 | `config.py` | 設定（接続・銘柄・ロット・時間足・戦略パラメータなど） |
-| `strategy.py` | 戦略インターフェース + 戦略（EMA20/75/200クロス・RSI逆張り・MAクロス） |
+| `strategy.py` | 戦略インターフェース + トレンド戦略（EMA20/75/200クロス）と指数計算（RSI/ADX） |
+| `range_strategy.py` | レンジ戦略（RSI逆張り + ADXフィルタ）。同じ Strategy インターフェース |
+| `regime.py` | 相場判定（ADX からトレンド/レンジを判定） |
 | `broker.py` | MT5 接続・レート取得・発注・決済・ポジション管理・起動時自己診断 |
-| `main.py` | 監視ループ（確定足ごとに戦略評価 → 発注） |
-| `test_strategy.py` | 戦略のユニットテスト（合成データで検証、MT5 不要） |
+| `main.py` | 監視ループ（確定足ごとにレジーム判定 → 戦略評価 → 発注） |
+| `test_strategy.py` | トレンド戦略のユニットテスト（合成データで検証、MT5 不要） |
+| `test_regime.py` | レジーム判定・レンジ戦略のユニットテスト |
 | `requirements.txt` | 依存関係 |
 | `README.md` | 本ドキュメント |
 
@@ -70,14 +73,31 @@ MT5 の Python API は、**端末がローカルに保持している履歴デ�
 | `ema_trend_filter` | `True` | EMA200 で逆トレンドのクロスを抑止するか |
 | `ema_tp_pct` | `0.005` | 利食い幅（エントリー価格比、`0` で無効） |
 | `ema_sl_pct` | `0.003` | 損切り幅（エントリー価格比、`0` で無効） |
+| `adx_period` | `14` | ADX の期間（レジーム判定・レンジ戦略のフィルタ） |
+| `adx_threshold` | `25.0` | これ未満をレンジ、以上をトレンドとみなす |
+| `rsi_period` | `14` | レンジ戦略の RSI 期間 |
+| `rsi_oversold` | `30.0` | 売られすぎ（これ未満からの反転で BUY） |
+| `rsi_overbought` | `70.0` | 買われすぎ（これ超えからの反転で SELL） |
+| `range_tp_pct` | `0.005` | レンジ戦略の利食い幅（エントリー価格比、`0` で無効） |
+| `range_sl_pct` | `0.003` | レンジ戦略の損切り幅（エントリー価格比、`0` で無効） |
 | `poll_interval` | `5.0` | 価格確認間隔（秒） |
 | `log_file` | `"mt5_autotrade.log"` | ログ出力先ファイル |
 
-## 現在の戦略（EMA 20/75/200 クロス + TP/SL）
+## 現在の戦略（トレンド / レンジの2レジーム切替）
 
-`strategy.py` の `EMACrossStrategy` が有効です。確定足から EMA20・EMA75・EMA200 を計算し、
-**EMA20 と EMA75 のクロス**を売買シグナルに、**EMA200 を長期トレンドフィルタ**に使うトレンドフォローです。
-TP/SL（利食い・損切り）を注文時に設定します。
+確定足ごとに ADX(14) で相場を判定し、**トレンド相場では EMA クロス**、**レンジ相場では RSI 逆張り**へ自動で切り替えます。
+いずれも TP/SL（利食い・損切り）を注文時に設定します。
+
+### 相場判定（regime.py）
+
+| ADX（14） | 判定 | 使用戦略 |
+|---|---|---|
+| `25.0` 以上 | トレンド | `EMACrossStrategy`（EMA20/75/200 クロス） |
+| `25.0` 未満 | レンジ | `RSIRangeStrategy`（RSI 逆張り + ADX フィルタ） |
+
+### トレンド相場（EMA20/75/200 クロス）
+
+`strategy.py` の `EMACrossStrategy` が担当します。EMA20 と EMA75 のクロスを売買シグナルに、EMA200 を長期トレンドフィルタに使います。
 
 | 条件 | シグナル | 動作 |
 |---|---|---|
@@ -86,16 +106,25 @@ TP/SL（利食い・損切り）を注文時に設定します。
 | トレンドに逆らうクロス（価格が EMA200 の反対側） | `HOLD` | 見送り |
 | それ以外 | `HOLD` | 何もしない |
 
-クロス判定は直近2本の確定足で行います。EMA200 フィルタは長期トレンドに逆らうクロスを無視します
-（`config.py` の `ema_trend_filter = False` で無効化できます）。
+### レンジ相場（RSI 逆張り + ADX フィルタ）
+
+`range_strategy.py` の `RSIRangeStrategy` が担当します。ADX が閾値未満（レンジ）のときだけ発火し、RSI の売られすぎ/買われすぎからの反転を狙います。
+
+| 条件 | シグナル | 動作 |
+|---|---|---|
+| RSI が売られすぎ(30)を下から上に抜けて反転 | `BUY` | 買い |
+| RSI が買われすぎ(70)を上から下に抜けて反転 | `SELL` | 売り |
+| ADX が閾値以上（トレンド） | `HOLD` | 見送り |
+| それ以外 | `HOLD` | 何もしない |
 
 ### 発注時の挙動
 
 - 新規注文時に **テイクプロフィット（+0.5%）** と **ストップロス（-0.3%）** を同時に設定します（サーバー側で管理）。
 - 逆向きポジションを保有中に逆向きシグナルが出た場合は、決済してから新規（＝ドテン）。
 - 同じ向きのポジションを保有中は追加発注しません（増玉なし）。
+- **相場が切り替わるとき、旧レジームで建てたポジションは手仕舞わず TP/SL の到達待ち**（新レジームのシグナルでは反転しません）。
 
-> EMA の期間・トレンドフィルタ・TP/SL 幅は `config.py` の `ema_*` 項目で変更できます。
+> 各しきい値・期間・TP/SL 幅は `config.py` の `ema_*` / `adx_*` / `rsi_*` / `range_*` 項目で変更できます。
 > TP/SL はブローカーが定める最小ストップ距離（`stops_level`）より十分離す必要があります（近すぎるとリジェクトされます）。
 
 ## 実行
@@ -120,25 +149,27 @@ MT5 端末で BTCUSD の M5 チャートを開いてください。
 
 ## テスト
 
-戦略のシグナル判定ロジックは、MT5 への実接続なしで合成データから検証できます（`test_strategy.py`）。
+戦略のシグナル判定ロジックは、MT5 への実接続なしで合成データから検証できます。
+`test_strategy.py`（トレンド戦略）と `test_regime.py`（レジーム判定・レンジ戦略）があります。
 
 ```powershell
 # 詳細表示（各テスト名と OK/FAIL が出る）
-.\venv\Scripts\python.exe -m unittest test_strategy -v
+.\venv\Scripts\python.exe -m unittest test_strategy test_regime -v
 
 # 結果だけ表示
-.\venv\Scripts\python.exe -m unittest test_strategy
+.\venv\Scripts\python.exe -m unittest test_strategy test_regime
 ```
 
 `unittest` は標準ライブラリなので追加インストールは不要です（実行には `pandas` / `numpy` が必要で、`pip install -r requirements.txt` で揃います）。
 
-検証内容: EMA20×EMA75 のクロスで BUY/SELL が出ること、EMA200 フィルタが逆トレンドのクロスを抑止すること、履歴不足時や横ばい時に HOLD になること、など。
+検証内容: EMA20×EMA75 のクロスで BUY/SELL が出ること、EMA200 フィルタが逆トレンドのクロスを抑止すること、ADX によるトレンド/レンジ判定、RSI 逆張りの反転シグナルと ADX フィルタ、など。
 
 ## 戦略の差し替え方
 
-`strategy.py` に `Strategy` を継承したクラスを作り、`on_bar(df, pos_dir)` で
+`Strategy` を継承したクラスを作り、`on_bar(df, pos_dir)` で
 `Signal.BUY` / `Signal.SELL` / `Signal.CLOSE` / `Signal.HOLD` を返します。
-`main.py` の `strategy = ...` の行を変更するだけです。
+`main.py` の `trend_strategy` / `range_strategy` の生成箇所を差し替えるだけです。
+レンジ戦略を別ファイル（例: `range_strategy.py`）に置けば、同じインターフェースで追加できます。
 
 ```python
 from strategy import Strategy, Signal

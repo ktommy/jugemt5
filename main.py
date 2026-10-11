@@ -10,6 +10,8 @@ import MetaTrader5 as mt5
 
 from config import Config
 from strategy import Signal, EMACrossStrategy
+from range_strategy import RSIRangeStrategy
+from regime import Regime, detect_regime
 from broker import MT5Broker
 
 
@@ -75,11 +77,17 @@ def main() -> None:
     config = Config()
     setup_logging(config.log_file)
 
-    # 戦略を差し替える場合はここを変更する
-    strategy = EMACrossStrategy(
+    # トレンド相場用とレンジ相場用の戦略を用意し、レジーム判定で切り替える
+    trend_strategy = EMACrossStrategy(
         fast=config.ema_fast, mid=config.ema_mid, slow=config.ema_slow,
         tp_pct=config.ema_tp_pct, sl_pct=config.ema_sl_pct,
         trend_filter=config.ema_trend_filter,
+    )
+    range_strategy = RSIRangeStrategy(
+        period=config.rsi_period, oversold=config.rsi_oversold,
+        overbought=config.rsi_overbought,
+        adx_period=config.adx_period, adx_threshold=config.adx_threshold,
+        tp_pct=config.range_tp_pct, sl_pct=config.range_sl_pct,
     )
 
     broker = MT5Broker(config)
@@ -97,17 +105,24 @@ def main() -> None:
         return
 
     last_bar_time = None
+    last_regime = None
+    pos_regime = None  # 現在のポジションを建てたレジーム（未知/無しなら None）
     logging.info(
-        "監視開始: symbol=%s timeframe=%s strategy=%s lot=%s",
-        config.symbol, config.timeframe, strategy.name, config.lot,
+        "監視開始: symbol=%s timeframe=%s trend=%s range=%s lot=%s",
+        config.symbol, config.timeframe,
+        trend_strategy.name, range_strategy.name, config.lot,
     )
 
     try:
         while True:
-            # EMA(slow) の収束に必要な本数を戦略から取得（無ければ従来どおり 200）
+            # 各戦略が必要とする履歴本数を満たすよう取得する
             df = broker.get_rates(
                 config.symbol,
-                count=max(200, getattr(strategy, "min_history", 200) + 2),
+                count=max(
+                    200,
+                    getattr(trend_strategy, "min_history", 200) + 2,
+                    getattr(range_strategy, "min_history", 200) + 2,
+                ),
             )
             if df is None:
                 time.sleep(config.poll_interval)
@@ -124,22 +139,54 @@ def main() -> None:
             if bar_time != last_bar_time:
                 last_bar_time = bar_time
 
+                # 相場判定（トレンド / レンジ）と使用戦略の選択
+                regime = detect_regime(
+                    completed, config.adx_period, config.adx_threshold
+                )
+                active = trend_strategy if regime == Regime.TREND else range_strategy
+                if regime != last_regime:
+                    last_regime = regime
+                    logging.info(
+                        "相場判定: %s（%s）",
+                        regime.value, completed["time"].iloc[-1],
+                    )
+
                 position = broker.get_position(config.symbol)
                 pos_dir = 0 if position is None else (
                     1 if position.type == mt5.POSITION_TYPE_BUY else -1
                 )
-                signal = strategy.on_bar(completed, pos_dir)
+
+                # 保有継続: 旧レジームで建てたポジションは TP/SL に委ね、
+                # 新レジームのシグナルでは反転しない
+                if (
+                    position is not None
+                    and pos_regime is not None
+                    and pos_regime != regime
+                ):
+                    signal = Signal.HOLD
+                else:
+                    signal = active.on_bar(completed, pos_dir)
+
                 if signal != Signal.HOLD:
                     logging.info(
-                        "シグナル=%s (%s) 保有=%s",
+                        "シグナル=%s (%s) 戦略=%s 保有=%s",
                         signal.value, completed["time"].iloc[-1],
-                        "あり" if position else "なし",
+                        active.name, "あり" if position else "なし",
                     )
                 act_on_signal(
                     broker, config.symbol, config.lot, signal, position,
-                    sl_pct=getattr(strategy, "sl_pct", None),
-                    tp_pct=getattr(strategy, "tp_pct", None),
+                    sl_pct=getattr(active, "sl_pct", None),
+                    tp_pct=getattr(active, "tp_pct", None),
                 )
+
+                # ポジションの所有レジームを更新
+                new_position = broker.get_position(config.symbol)
+                if new_position is None:
+                    pos_regime = None
+                elif position is None and new_position is not None:
+                    pos_regime = regime           # 新規エントリーを建てたレジーム
+                elif pos_regime is None:
+                    pos_regime = regime           # 起動時の既存ポジションを採用
 
             time.sleep(config.poll_interval)
     except KeyboardInterrupt:

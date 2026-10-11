@@ -8,7 +8,7 @@ import time
 
 import MetaTrader5 as mt5
 
-from config import Config
+from config import load_config
 from strategy import Signal, EMACrossStrategy
 from range_strategy import RSIRangeStrategy
 from regime import Regime, detect_regime
@@ -74,7 +74,7 @@ def act_on_signal(broker: MT5Broker, symbol: str, lot: float,
 
 
 def main() -> None:
-    config = Config()
+    config = load_config()
     setup_logging(config.log_file)
 
     # トレンド相場用とレンジ相場用の戦略を用意し、レジーム判定で切り替える

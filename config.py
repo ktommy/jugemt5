@@ -3,7 +3,8 @@
 接続情報・取引対象・注文パラメータ・ループ間隔を一元管理する。
 本番運用では Config を直接書き換えるか、main.py 側で上書きして使う。
 """
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, fields
 
 
 def timeframe_to_int(name: str) -> int:
@@ -67,3 +68,28 @@ class Config:
 
     # --- ログ ---
     log_file: str = "mt5_autotrade.log"
+
+
+def _load_json(path: str) -> dict:
+    """JSON ファイルを dict として読み込む。無い、あるいは壊れていたら空 dict。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_config(base_path: str = "config.json",
+                override_path: str = "config_local.json") -> Config:
+    """JSON から設定を読み込み、Config を組み立てる。
+
+    - ``config.json`` が無い場合は dataclass の既定値をそのまま使う。
+    - ``config_local.json``（任意・Git 管理外）を ``config.json`` の上に重ねることで、
+      口座情報などローカル固有の設定を分離できる。
+    - JSON に未知のキーがあっても無視し、値が無いフィールドは既定値のまま。
+    """
+    data = _load_json(base_path)
+    data.update(_load_json(override_path))
+    valid = {f.name for f in fields(Config)}
+    return Config(**{k: v for k, v in data.items() if k in valid})

@@ -19,6 +19,7 @@ mt5_autotrade.log
 
 # --- 認証情報を分けた場合（任意） ---
 config_local.py
+config_local.json
 
 # --- エディタ / OS ---
 .idea/

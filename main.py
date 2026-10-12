@@ -126,11 +126,17 @@ def main() -> None:
     for symbol in config.symbols:
         mt5.symbol_select(symbol, True)
 
-    # 起動時自己診断: 履歴が取得できる銘柄だけを候補に残す
+    # レジーム判定の時間足（上位足）。未設定/同一なら単一時間足（従来挙動）
+    regime_tf = (config.regime_timeframe or "").strip() or config.timeframe
+    multi_tf = regime_tf.upper() != config.timeframe.upper()
+
+    # 起動時自己診断: 履歴が取得できる銘柄だけを候補に残す（上位足もチェック）
     symbols = []
     for symbol in config.symbols:
         try:
             broker.ensure_history(symbol)
+            if multi_tf:
+                broker.ensure_history(symbol, timeframe=regime_tf)
             symbols.append(symbol)
         except RuntimeError as exc:
             logging.error(exc)
@@ -152,6 +158,9 @@ def main() -> None:
     def get_rates(symbol):
         return broker.get_rates(symbol, count)
 
+    def get_regime_rates(symbol):
+        return broker.get_rates(symbol, count, timeframe=regime_tf)
+
     # 起動時に保有中のポジションがあれば引き継ぐ（レジーム不明なので直近barで採用）
     existing = broker.get_any_position()
     pos_symbol = existing.symbol if existing is not None else None
@@ -161,8 +170,8 @@ def main() -> None:
     last_bar_time = None
 
     logging.info(
-        "監視開始: symbols=%s timeframe=%s trend=%s range=%s risk=%s%% atr=%s",
-        symbols, config.timeframe,
+        "監視開始: symbols=%s timeframe=%s regime=%s trend=%s range=%s risk=%s%% atr=%s",
+        symbols, config.timeframe, regime_tf,
         trend_strategy.name, range_strategy.name,
         config.risk_percent * 100, config.atr_period,
     )
@@ -187,6 +196,7 @@ def main() -> None:
                 candidates = scan_signals(
                     symbols, trend_strategy, range_strategy, get_rates,
                     config.adx_period, config.adx_threshold,
+                    get_regime_rates=get_regime_rates if multi_tf else None,
                 )
                 for r in candidates:
                     logging.info(
@@ -235,8 +245,17 @@ def main() -> None:
                     time.sleep(config.poll_interval)
                     continue
 
+                if multi_tf:
+                    regime_df = get_regime_rates(pos_symbol)
+                    if regime_df is None or len(regime_df) < 2:
+                        time.sleep(config.poll_interval)
+                        continue
+                    regime_completed = regime_df.iloc[:-1]
+                else:
+                    regime_completed = completed
+
                 regime = detect_regime(
-                    completed, config.adx_period, config.adx_threshold
+                    regime_completed, config.adx_period, config.adx_threshold
                 )
                 if regime != holding_regime:
                     holding_regime = regime

@@ -26,6 +26,7 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+import numpy as np
 import pandas as pd
 
 from config import load_config
@@ -179,6 +180,40 @@ def _atr(completed: pd.DataFrame, period: int) -> Optional[float]:
     return val if val > 0 else None
 
 
+_TF_STEPS = {
+    "M1": "1min", "M5": "5min", "M15": "15min", "M30": "30min",
+    "H1": "1h", "H4": "4h",
+    "D1": "1D", "W1": "7D", "MN1": "30D",   # D1 以上は暦日近似（週末は滑らかでない点は割り切る）
+}
+
+
+def _tf_step(tf: str) -> pd.Timedelta:
+    """時間足名をバーの長さ（Timedelta）に変換する。未知は H1 相当（timeframe_to_int と同じ既定）。"""
+    return pd.to_timedelta(_TF_STEPS.get(str(tf).upper(), "1h"))
+
+
+def _align_adx(trade_df: pd.DataFrame, regime_df: pd.DataFrame,
+               adx_period: int, trade_tf: str, regime_tf: str) -> np.ndarray:
+    """上位時間足の ADX を、取引足の各足 i に「その足の確定時点で完成済みの上位足」で対応付ける。
+
+    取引足 i（開時刻 t_i）は確定時点が t_i + trade_step。上位足（開時刻 T、長さ regime_step）は
+    T + regime_step <= t_i + trade_step を満たすとき完成済みなので、
+    T <= t_i - (regime_step - trade_step) を満たす上位足まで使える（見通しバイアス回避）。
+    十分な上位足履歴が無い足は安全側に TREND 相当の高 ADX（=100）を置く（detect_regime の
+    「履歴不足 → TREND」既定と整合させる）。
+    """
+    n = len(trade_df)
+    out = np.full(n, 100.0)
+    reg_adx = compute_adx(regime_df, adx_period).to_numpy()
+    reg_times = pd.DatetimeIndex(regime_df["time"])
+    trade_times = pd.DatetimeIndex(trade_df["time"])
+    lag = _tf_step(regime_tf) - _tf_step(trade_tf)
+    idx = reg_times.searchsorted(trade_times - lag, side="right") - 1
+    valid = idx >= adx_period   # ADX が安定する最低本数を待ってから採用
+    out[valid] = reg_adx[idx[valid]]
+    return out
+
+
 class _Indicators:
     """全履歴の指標を一度だけベクトル計算し、各足では O(1) で参照するためのキャッシュ。
 
@@ -188,15 +223,22 @@ class _Indicators:
     ループ内は配列の添字参照だけで済む（合計 O(n)）。
     """
 
-    def __init__(self, df: pd.DataFrame, trend, range_, adx_period: int, atr_period: int):
+    def __init__(self, df: pd.DataFrame, trend, range_, adx_period: int, atr_period: int,
+                 regime_df: Optional[pd.DataFrame] = None,
+                 trade_tf: Optional[str] = None, regime_tf: Optional[str] = None):
         close = df["close"]
         self.close = close.to_numpy()
         self.ema_fast = close.ewm(span=getattr(trend, "fast", 20), adjust=False).mean().to_numpy()
         self.ema_mid = close.ewm(span=getattr(trend, "mid", 75), adjust=False).mean().to_numpy()
         self.ema_slow = close.ewm(span=getattr(trend, "slow", 200), adjust=False).mean().to_numpy()
-        self.adx = compute_adx(df, adx_period).to_numpy()
         self.atr = compute_atr(df, atr_period).to_numpy()
         self.rsi = compute_rsi(close, getattr(range_, "period", 14)).to_numpy()
+        # ADX はレジーム判定とレンジ戦略の ADX フィルタの両方で使う。regime_df を渡すと
+        # 上位時間足の ADX を取引足に時間対応付けたものになり、二つの判定が同じ尺度になる。
+        if regime_df is None:
+            self.adx = compute_adx(df, adx_period).to_numpy()
+        else:
+            self.adx = _align_adx(df, regime_df, adx_period, trade_tf, regime_tf)
 
 
 def _ema_signal(ind: _Indicators, i: int, strategy: EMACrossStrategy) -> Signal:
@@ -291,7 +333,9 @@ def _close(pos: _Pos, bar, exit_px: float, reason: str, index: int,
 def run(df: pd.DataFrame, symbol: str, trend_strategy, range_strategy,
         adx_period: int = 14, adx_threshold: float = 25.0,
         atr_period: int = 14, spread_price: float = 0.0,
-        force_regime: Optional[str] = None) -> List[Trade]:
+        force_regime: Optional[str] = None,
+        regime_df: Optional[pd.DataFrame] = None,
+        trade_tf: Optional[str] = None, regime_tf: Optional[str] = None) -> List[Trade]:
     """単一銘柄の履歴を1本ずつ流して仮想売買を再現し、トレード列を返す。
 
     組み込み戦略（EMAクロス / RSIレンジ）は指標を全履歴で一度だけ前計算し、
@@ -302,6 +346,9 @@ def run(df: pd.DataFrame, symbol: str, trend_strategy, range_strategy,
     spread_price は往復 1 トレードのスプレッドコスト（価格単位）。0 なら控除しない。
     force_regime に "trend" / "range" を渡すと ADX 判定を無視してその戦略に固定する
     （単一戦略の単独検証やパラメータスイープ用）。None なら通常の自動切替。
+    regime_df に上位時間足の履歴を渡すと、レジーム判定（＝戦略切替とレンジ戦略の ADX
+    フィルタ）をその上位足の ADX で行う（見通しバイアスは時間対応付けで回避）。None なら
+    シグナルと同じ時間足（従来挙動）。上位足は組み込み戦略のベクトル計算パスのみ対応。
     """
     n = len(df)
     warmup = max(
@@ -315,7 +362,8 @@ def run(df: pd.DataFrame, symbol: str, trend_strategy, range_strategy,
     # 組み込み戦略ならベクトル計算パス、そうでなければ on_bar をそのまま呼ぶ
     vectorized = (isinstance(trend_strategy, EMACrossStrategy)
                   and isinstance(range_strategy, RSIRangeStrategy))
-    ind = _Indicators(df, trend_strategy, range_strategy, adx_period, atr_period) \
+    ind = _Indicators(df, trend_strategy, range_strategy, adx_period, atr_period,
+                      regime_df if vectorized else None, trade_tf, regime_tf) \
         if vectorized else None
 
     def regime_for(i: int, completed) -> Regime:
@@ -479,9 +527,9 @@ def _slice_time(df, start, end):
     return df[mask].reset_index(drop=True)
 
 
-def _fetch_df(args, broker, sym, start=None, end=None):
+def _fetch_df(args, broker, sym, start=None, end=None, timeframe=None):
     if args.source == "mt5":
-        df = broker.get_history(sym, max_bars=args.max_bars)
+        df = broker.get_history(sym, max_bars=args.max_bars, timeframe=timeframe)
     else:
         df = load_csv_history(sym, args.csv_dir)
     return _slice_time(df, start, end) if df is not None else None
@@ -564,6 +612,8 @@ def main(argv=None) -> None:
     parser.add_argument("--csv-dir", default="backtest_data", help="CSV の配置先")
     parser.add_argument("--timeframe", default=None,
                         help="時間足（M5/H1/H4 など）。省略時は config.json の timeframe。MT5 取得専用で config は変更しない")
+    parser.add_argument("--regime-timeframe", default=None,
+                        help="レジーム判定（ADX）に使う上位時間足（例 M15）。省略時は config.json の regime_timeframe。取引時間足と同じなら単一時間足")
     parser.add_argument("--max-bars", type=int, default=50000, help="MT5 から取得する最大本数")
     parser.add_argument("--spread", type=float, default=None,
                         help="スプレッドを価格単位で固定（省略時は mt5 で実値を取得 / csv で config.spread_price を使用）")
@@ -593,6 +643,18 @@ def main(argv=None) -> None:
     symbols = [args.symbol] if args.symbol else list(cfg.symbols)
     trend, range_ = build_strategies(cfg)
 
+    # レジーム判定の上位時間足（シグナルは cfg.timeframe のまま）
+    trade_tf = cfg.timeframe
+    regime_tf_raw = args.regime_timeframe if args.regime_timeframe is not None else cfg.regime_timeframe
+    regime_tf = (regime_tf_raw or "").strip() or trade_tf
+    multi_tf = regime_tf.upper() != trade_tf.upper()
+    if multi_tf and args.source != "mt5":
+        log.warning("CSV は単一時間足のみ。上位TFレジーム（%s）は使わず %s で判定します", regime_tf, trade_tf)
+        regime_tf = trade_tf
+        multi_tf = False
+    if multi_tf:
+        log.info("上位TFレジーム: %s（シグナル %s）", regime_tf, trade_tf)
+
     broker = None
     if args.source == "mt5":
         import MetaTrader5 as mt5
@@ -616,16 +678,26 @@ def main(argv=None) -> None:
     try:
         for sym in symbols:
             log.info("バックテスト対象: %s", sym)
-            df = _fetch_df(args, broker, sym, start, end)
+            df = _fetch_df(args, broker, sym, start, end, timeframe=trade_tf)
             if df is None or len(df) < 60:
                 log.warning("履歴なし/不足: %s（%s 本）", sym, 0 if df is None else len(df))
                 continue
             spread_price = _spread_for(args, broker, sym, cfg)
             if spread_price:
                 log.info("スプレッド想定: %s = %s（価格単位）", sym, spread_price)
+
+            regime_df = None
+            if multi_tf:
+                regime_df = _fetch_df(args, broker, sym, start, end, timeframe=regime_tf)
+                if regime_df is None or len(regime_df) < 60:
+                    log.warning("上位TF履歴なし/不足: %s（%s）→ 単一時間足へフォールバック", sym, regime_tf)
+                    regime_df = None
+
             trades = run(df, sym, trend, range_,
                          cfg.adx_period, cfg.adx_threshold, cfg.atr_period,
-                         spread_price=spread_price)
+                         spread_price=spread_price,
+                         regime_df=regime_df,
+                         trade_tf=trade_tf, regime_tf=regime_tf)
             print_summary(sym, summarize(trades), _span_of(df))
             all_trades.extend(trades)
     finally:

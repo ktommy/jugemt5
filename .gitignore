@@ -27,5 +27,9 @@ config_local.json
 *.swp
 .DS_Store
 
+# --- バックテスト生成物（実行のたびに変わる出力・入力データ） ---
+backtest_trades.csv
+backtest_data/
+
 # --- Claude Code ローカル設定 ---
 .claude/

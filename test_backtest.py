@@ -8,12 +8,12 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from strategy import Strategy, Signal, EMACrossStrategy
+from strategy import Strategy, Signal, EMACrossStrategy, compute_adx
 from range_strategy import RSIRangeStrategy
 from regime import Regime
 from backtest import (
     run, summarize, Trade, _Pos, _check_stops,
-    _Indicators, _ema_signal, _rsi_range_signal,
+    _Indicators, _ema_signal, _rsi_range_signal, _align_adx,
 )
 
 
@@ -130,6 +130,38 @@ class RunTest(unittest.TestCase):
         self.assertEqual(t.strategy, "fire_once")
         self.assertEqual(t.exit_reason, "TP")
 
+    def test_run_regime_from_higher_tf(self):
+        # 取引足（M5）は強い下落→戻しで、M5 単体なら ADX 高（トレンド）。だが
+        # 上位足（M15）を全平坦にして渡すと、レジームは上位足の RANGE になり、
+        # RSI 逆張りが発火する ―― regime が上位足由来であることを確認する。
+        close = np.concatenate([
+            np.linspace(100.0, 90.0, 350),   # 下落（M5 ADX 高、RSI 売られすぎへ）
+            np.linspace(90.0, 100.0, 60),    # 戻し（RSI 30 を下から上に抜け BUY）
+        ])
+        n = len(close)
+        trade = pd.DataFrame({
+            "time": pd.date_range("2026-01-01", periods=n, freq="5min"),
+            "open": close, "high": close + 0.2, "low": close - 0.2, "close": close,
+        })
+        regime = pd.DataFrame({
+            "time": pd.date_range("2026-01-01", periods=160, freq="15min"),
+            "open": np.full(160, 100.0), "high": np.full(160, 100.2),
+            "low": np.full(160, 99.8), "close": np.full(160, 100.0),
+        })
+        trend, range_ = self._real_strategies()
+        trades = self._run(trade, trend, range_,
+                           regime_df=regime, trade_tf="M5", regime_tf="M15")
+        self.assertGreater(len(trades), 0)
+        self.assertTrue(all(t.regime == "range" for t in trades))
+
+    def _real_strategies(self):
+        trend = EMACrossStrategy(fast=20, mid=75, slow=200,
+                                 tp_atr_mult=3.0, sl_atr_mult=2.0, trend_filter=True)
+        range_ = RSIRangeStrategy(period=14, oversold=30.0, overbought=70.0,
+                                  adx_period=14, adx_threshold=25.0,
+                                  tp_atr_mult=2.0, sl_atr_mult=2.0)
+        return trend, range_
+
 
 class StopsTest(unittest.TestCase):
     def test_same_bar_sl_priority(self):
@@ -192,6 +224,46 @@ class VectorizedTest(unittest.TestCase):
             ref = df.iloc[: i + 1]
             self.assertEqual(_ema_signal(ind, i, trend), trend.on_bar(ref, 0), f"EMA @{i}")
             self.assertEqual(_rsi_range_signal(ind, i, range_), range_.on_bar(ref, 0), f"RSI @{i}")
+
+
+class AlignTest(unittest.TestCase):
+    """上位時間足の ADX を取引足に時間対応付ける _align_adx の検証。"""
+
+    def _trade(self, n):
+        return pd.DataFrame({
+            "time": pd.date_range("2026-01-01", periods=n, freq="5min"),
+            "close": np.full(n, 100.0),
+        })
+
+    def test_length_and_warmup_sentinel(self):
+        # 上位足が足りない序盤は安全側に TREND 相当（100）、履歴が揃うと平坦なら RANGE（<閾値）
+        trade = self._trade(100)
+        regime = pd.DataFrame({
+            "time": pd.date_range("2026-01-01", periods=30, freq="15min"),
+            "high": np.full(30, 100.2), "low": np.full(30, 99.8),
+            "close": np.full(30, 100.0),
+        })
+        out = _align_adx(trade, regime, 14, "M5", "M15")
+        self.assertEqual(len(out), 100)
+        self.assertEqual(out[0], 100.0)      # 履歴不足 → TREND 相当
+        self.assertLess(out[-1], 25.0)       # 平坦な上位足が揃う → RANGE
+
+    def test_uses_only_completed_higher_tf_bar(self):
+        # M15 上位足を「40 本の平坦（レンジ, ADX≈0）→ 40 本の上昇（トレンド, ADX=100）」で作る。
+        # 取引 M5 の 13:35 の足（index 163）は「T <= 13:35 - (15分-5分) = 13:25」を満たす
+        # M15 13:15（idx 53, まだ平坦=レンジ）までしか使えず、形成中の M15 13:30（idx 54,
+        # すでに上昇=トレンド）は参照しない。これで上位足の「完成済みのみ」＝見通し回避を検証する。
+        close = np.concatenate([np.full(40, 100.0), np.linspace(100.0, 130.0, 40)])
+        regime = pd.DataFrame({
+            "time": pd.date_range("2026-01-01", periods=80, freq="15min"),
+            "high": close + 0.2, "low": close - 0.2, "close": close,
+        })
+        trade = self._trade(200)
+        out = _align_adx(trade, regime, 14, "M5", "M15")
+        reg_adx = compute_adx(regime, 14).to_numpy()
+        self.assertEqual(out[163], reg_adx[53])   # 完成済みの 13:15 を採用
+        self.assertLess(out[163], 25.0)           # → レンジ（ADX 低）
+        self.assertGreaterEqual(reg_adx[54], 25.0)  # 形成中の 13:30 はトレンドなのに参照されない
 
 
 class SummarizeTest(unittest.TestCase):

@@ -14,6 +14,7 @@
     "NZDUSD"
   ],
   "timeframe": "M5",
+  "regime_timeframe": "M15",
 
   "lot": 0.01,
   "magic": 20261010,

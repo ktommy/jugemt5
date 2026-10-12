@@ -48,9 +48,18 @@ class MT5Broker:
         log.info("MT5 切断しました")
 
     # ---------- データ取得 ----------
-    def get_rates(self, symbol: str, count: int = 200) -> Optional[pd.DataFrame]:
-        """直近 count 本のローソク足を取得（末尾は未確定の形成中足を含む）。"""
-        rates = mt5.copy_rates_from_pos(symbol, self.timeframe, 0, count)
+    def _tf(self, timeframe: Optional[str] = None) -> int:
+        """timeframe 指定を MT5 の定数に変換する。None なら既定（config）を使う。"""
+        return self.timeframe if timeframe is None else timeframe_to_int(timeframe)
+
+    def get_rates(self, symbol: str, count: int = 200,
+                  timeframe: Optional[str] = None) -> Optional[pd.DataFrame]:
+        """直近 count 本のローソク足を取得（末尾は未確定の形成中足を含む）。
+
+        timeframe を省略すると config.timeframe。上位時間足のレジーム判定など、
+        別の時間足を明示的に取得したい場合に指定する。
+        """
+        rates = mt5.copy_rates_from_pos(symbol, self._tf(timeframe), 0, count)
         if rates is None or len(rates) == 0:
             log.warning("レート取得失敗: %s (%s)", symbol, mt5.last_error())
             return None
@@ -58,7 +67,8 @@ class MT5Broker:
         df["time"] = pd.to_datetime(df["time"], unit="s")
         return df
 
-    def get_history(self, symbol: str, max_bars: int = 50000) -> Optional[pd.DataFrame]:
+    def get_history(self, symbol: str, max_bars: int = 50000,
+                    timeframe: Optional[str] = None) -> Optional[pd.DataFrame]:
         """指定銘柄の履歴を可能な限り（最大 max_bars 本）ページング取得する。
 
         copy_rates_from_pos は端末が同期済みの本数しか返さないため、count 刻みで
@@ -68,9 +78,10 @@ class MT5Broker:
         chunks = []
         start = 0
         total = 0
+        tf = self._tf(timeframe)
         log.info("履歴取得開始: %s（最大 %d 本）", symbol, max_bars)
         while total < max_bars:
-            chunk = mt5.copy_rates_from_pos(symbol, self.timeframe, start, step)
+            chunk = mt5.copy_rates_from_pos(symbol, tf, start, step)
             if chunk is None or len(chunk) == 0:
                 break
             chunks.append(chunk)
@@ -99,22 +110,24 @@ class MT5Broker:
             return 0.0
         return float(info.spread * info.point)
 
-    def ensure_history(self, symbol: str, count: int = 3) -> None:
+    def ensure_history(self, symbol: str, count: int = 3,
+                       timeframe: Optional[str] = None) -> None:
         """起動時の自己診断: 履歴データが取得できるか確認する。
 
         取得できない場合（端末が該当シンボル×時間足の履歴を未同期）、
         ユーザーに具体的な対処（チャートを開く）を示す RuntimeError を投げる。
         """
-        df = self.get_rates(symbol, count=count)
+        tf_name = self.config.timeframe if timeframe is None else timeframe
+        df = self.get_rates(symbol, count=count, timeframe=timeframe)
         if df is None:
             raise RuntimeError(
-                f"{symbol} の {self.config.timeframe} の履歴データを取得できません"
+                f"{symbol} の {tf_name} の履歴データを取得できません"
                 f"（{mt5.last_error()}）。\n"
-                f"MT5 端末で {symbol} の {self.config.timeframe} チャートを開いてください。"
+                f"MT5 端末で {symbol} の {tf_name} チャートを開いてください。"
             )
         log.info(
             "履歴データ確認OK: %s %s（取得 %d 本）",
-            symbol, self.config.timeframe, len(df),
+            symbol, tf_name, len(df),
         )
 
     # ---------- ポジション ----------

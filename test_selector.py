@@ -74,6 +74,20 @@ class ScanSignalsTest(unittest.TestCase):
         self.assertEqual(results[0].signal, Signal.SELL)
         self.assertEqual(results[0].regime, Regime.RANGE)
 
+    def test_regime_from_separate_higher_tf_feed(self):
+        # シグナルは get_rates（M5 想定）、レジームは get_regime_rates（M15 想定）から来る。
+        # M5 が上昇（単体なら TREND）でも、M15 が平坦（RANGE）なら regime==RANGE になる。
+        rate_map = {"sym": market(np.linspace(100.0, 130.0, 300))}   # M5: トレンド
+        regime_map = {"sym": market(np.full(100, 100.0))}            # M15: 平坦=レンジ
+        results = scan_signals(
+            ["sym"], FakeStrategy(Signal.HOLD), FakeStrategy(Signal.BUY),
+            lambda s: rate_map.get(s), 14, 25.0,
+            get_regime_rates=lambda s: regime_map.get(s),
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].signal, Signal.BUY)
+        self.assertEqual(results[0].regime, Regime.RANGE)
+
     def test_empty_when_none_fire(self):
         rate_map = {
             "A": market(np.full(300, 100.0)),

@@ -8,7 +8,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from strategy import EMACrossStrategy, Signal
+from strategy import EMACrossStrategy, Signal, compute_atr
 
 
 def make_df(close) -> pd.DataFrame:
@@ -102,6 +102,21 @@ class EMACrossStrategyTest(unittest.TestCase):
         close = np.full(200, 100.0)
         close[-1] = 115.0
         self.assertEqual(s.on_bar(make_df(close), 0), Signal.BUY)
+
+
+class AtrTest(unittest.TestCase):
+    def test_atr_positive_in_trend_small_in_flat(self):
+        # トレンドでは ATR が大きく、横ばいでは真のレンジ（1.0）に収束する
+        close = np.linspace(100, 130, 300)
+        trend = pd.DataFrame({
+            "high": close + 0.5, "low": close - 0.5, "close": close,
+        })
+        flat = pd.DataFrame({
+            "high": np.full(300, 100.5), "low": np.full(300, 99.5),
+            "close": np.full(300, 100.0),
+        })
+        self.assertGreater(compute_atr(trend, 14).iloc[-1], 0.5)
+        self.assertAlmostEqual(compute_atr(flat, 14).iloc[-1], 1.0)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ import time
 import MetaTrader5 as mt5
 
 from config import load_config
-from strategy import Signal, EMACrossStrategy
+from strategy import Signal, EMACrossStrategy, compute_atr
 from range_strategy import RSIRangeStrategy
 from regime import Regime, detect_regime
 from selector import scan_signals
@@ -27,22 +27,30 @@ def setup_logging(log_file: str) -> None:
     )
 
 
-def _order_prices(tick, signal: Signal, tp_pct, sl_pct):
-    """新規注文の TP / SL 価格を計算する（BUY/SELL で上下が異なる）。"""
+def _exit_prices(tick, signal: Signal, atr, sl_atr_mult, tp_atr_mult):
+    """新規注文の TP / SL 価格を ATR 倍数で計算する（BUY/SELL で上下が異なる）。
+
+    atr は最新確定足時点の平均真のレンジ。倍数が None/0 ならその側は無効。
+    リスク正規化のため、価格は FX と BTC で共通の「ATR 倍数」で決める。
+    """
     if signal == Signal.BUY:
         entry = tick.ask
-        tp = entry * (1 + tp_pct) if tp_pct else None
-        sl = entry * (1 - sl_pct) if sl_pct else None
+        tp = entry + tp_atr_mult * atr if tp_atr_mult else None
+        sl = entry - sl_atr_mult * atr if sl_atr_mult else None
     else:
         entry = tick.bid
-        tp = entry * (1 - tp_pct) if tp_pct else None
-        sl = entry * (1 + sl_pct) if sl_pct else None
+        tp = entry - tp_atr_mult * atr if tp_atr_mult else None
+        sl = entry + sl_atr_mult * atr if sl_atr_mult else None
     return entry, tp, sl
 
 
-def act_on_signal(broker: MT5Broker, symbol: str, lot: float,
-                  signal: Signal, position, sl_pct=None, tp_pct=None):
-    """シグナルと現在のポジションから実際の売買を実行する。"""
+def act_on_signal(broker: MT5Broker, symbol: str, signal: Signal, position,
+                  atr, sl_atr_mult=None, tp_atr_mult=None):
+    """シグナルと現在のポジションから実際の売買を実行する。
+
+    ロットは「1 トレードのリスク（risk_percent × 証拠金）」を SL 距離で割って
+    自動計算する（compute_lot）。これで FX と BTC が同じリスク額で発注される。
+    """
     if signal == Signal.HOLD:
         return position
 
@@ -64,11 +72,12 @@ def act_on_signal(broker: MT5Broker, symbol: str, lot: float,
 
     if position is None:
         tick = broker.get_tick(symbol)
+        entry, tp, sl = _exit_prices(tick, signal, atr, sl_atr_mult, tp_atr_mult)
+        risk_amount = broker.account_equity() * broker.config.risk_percent
+        lot = broker.compute_lot(symbol, entry, sl, risk_amount)
         if signal == Signal.BUY:
-            _, tp, sl = _order_prices(tick, signal, tp_pct, sl_pct)
             broker.market_buy(symbol, lot, sl=sl, tp=tp)
         elif signal == Signal.SELL:
-            _, tp, sl = _order_prices(tick, signal, tp_pct, sl_pct)
             broker.market_sell(symbol, lot, sl=sl, tp=tp)
 
     return broker.get_position(symbol)
@@ -81,6 +90,18 @@ def _pos_dir(position) -> int:
     return 1 if position.type == mt5.POSITION_TYPE_BUY else -1
 
 
+def _latest_atr(df, period: int):
+    """レート DataFrame（末尾に形成中足を含む）から最新確定足の ATR を返す。
+
+    履歴不足や NaN・非正値の場合は None を返す（呼び出し側で発注を見送る）。
+    """
+    if df is None or len(df) < period + 3:
+        return None
+    atr = compute_atr(df.iloc[:-1], period)
+    val = float(atr.iloc[-1])
+    return val if val > 0 else None
+
+
 def main() -> None:
     config = load_config()
     setup_logging(config.log_file)
@@ -88,14 +109,14 @@ def main() -> None:
     # トレンド相場用とレンジ相場用の戦略を用意し、レジーム判定で切り替える
     trend_strategy = EMACrossStrategy(
         fast=config.ema_fast, mid=config.ema_mid, slow=config.ema_slow,
-        tp_pct=config.ema_tp_pct, sl_pct=config.ema_sl_pct,
+        tp_atr_mult=config.ema_tp_atr, sl_atr_mult=config.ema_sl_atr,
         trend_filter=config.ema_trend_filter,
     )
     range_strategy = RSIRangeStrategy(
         period=config.rsi_period, oversold=config.rsi_oversold,
         overbought=config.rsi_overbought,
         adx_period=config.adx_period, adx_threshold=config.adx_threshold,
-        tp_pct=config.range_tp_pct, sl_pct=config.range_sl_pct,
+        tp_atr_mult=config.range_tp_atr, sl_atr_mult=config.range_sl_atr,
     )
 
     broker = MT5Broker(config)
@@ -140,9 +161,10 @@ def main() -> None:
     last_bar_time = None
 
     logging.info(
-        "監視開始: symbols=%s timeframe=%s trend=%s range=%s lot=%s",
+        "監視開始: symbols=%s timeframe=%s trend=%s range=%s risk=%s%% atr=%s",
         symbols, config.timeframe,
-        trend_strategy.name, range_strategy.name, config.lot,
+        trend_strategy.name, range_strategy.name,
+        config.risk_percent * 100, config.atr_period,
     )
 
     try:
@@ -180,10 +202,15 @@ def main() -> None:
                     "選択: %s %s（regime=%s）",
                     best.symbol, best.signal.value, best.regime.value,
                 )
+                atr = _latest_atr(get_rates(best.symbol), config.atr_period)
+                if atr is None:
+                    logging.warning("ATR を算出できず見送り: %s", best.symbol)
+                    time.sleep(config.poll_interval)
+                    continue
                 act_on_signal(
-                    broker, best.symbol, config.lot, best.signal, None,
-                    sl_pct=getattr(best.strategy, "sl_pct", None),
-                    tp_pct=getattr(best.strategy, "tp_pct", None),
+                    broker, best.symbol, best.signal, None, atr,
+                    sl_atr_mult=getattr(best.strategy, "sl_atr_mult", None),
+                    tp_atr_mult=getattr(best.strategy, "tp_atr_mult", None),
                 )
 
                 new_position = broker.get_position(best.symbol)
@@ -228,10 +255,15 @@ def main() -> None:
                         signal.value, pos_symbol, active.name,
                         completed["time"].iloc[-1],
                     )
+                atr = _latest_atr(df, config.atr_period)
+                if atr is None:
+                    logging.warning("ATR を算出できず見送り: %s", pos_symbol)
+                    time.sleep(config.poll_interval)
+                    continue
                 act_on_signal(
-                    broker, pos_symbol, config.lot, signal, position,
-                    sl_pct=getattr(active, "sl_pct", None),
-                    tp_pct=getattr(active, "tp_pct", None),
+                    broker, pos_symbol, signal, position, atr,
+                    sl_atr_mult=getattr(active, "sl_atr_mult", None),
+                    tp_atr_mult=getattr(active, "tp_atr_mult", None),
                 )
 
                 new_position = broker.get_position(pos_symbol)

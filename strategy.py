@@ -31,25 +31,34 @@ def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return rsi.fillna(50.0)
 
 
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Wilder の ATR（平均真のレンジ）を計算する。
+
+    真のレンジ（TR）を指数平滑（alpha=1/period）で平均した、銘柄のボラティリティ指標。
+    TP/SL の幅やポジションサイジングの基準に使う。
+    """
+    high, low, close = df["high"], df["low"], df["close"]
+    tr = pd.concat(
+        [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+
+
 def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """Wilder の ADX（平均方向性指数）を計算する。
 
     +DM / -DM / TR(ATR) を指数平滑（alpha=1/period）で平均し、
     +DI / -DI → DX → ADX の順に求める。方向性の無い横ばいでは 0 に近づく。
     """
-    high, low, close = df["high"], df["low"], df["close"]
+    high, low = df["high"], df["low"]
     up = high.diff()
     down = -low.diff()
 
     plus_dm = up.where((up > down) & (up > 0), 0.0)
     minus_dm = down.where((down > up) & (down > 0), 0.0)
 
-    tr = pd.concat(
-        [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()],
-        axis=1,
-    ).max(axis=1)
-
-    atr = tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    atr = compute_atr(df, period)
     plus_di = 100 * plus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr
     minus_di = 100 * minus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr
 
@@ -112,7 +121,7 @@ class RSIReversalStrategy(Strategy):
     - RSI が買われすぎ（overbought）から反転下降 → SELL
     - 保有中に RSI が中立水準（exit_level）へ戻る → CLOSE
 
-    tp_pct / sl_pct はエントリー価格に対する利食い・損切り幅（比率）。
+    tp_atr_mult / sl_atr_mult はエントリー後の利食い・損切り幅（ATR 倍数、リスク正規化用）。
     0 を指定するとその側の TP/SL を無効にする（main.py が参照する）。
     """
 
@@ -124,15 +133,15 @@ class RSIReversalStrategy(Strategy):
         oversold: float = 30.0,
         overbought: float = 70.0,
         exit_level: float = 50.0,
-        tp_pct: float = 0.005,   # +0.5% で利食い
-        sl_pct: float = 0.003,   # -0.3% で損切り
+        tp_atr_mult: float = 2.0,   # +2×ATR で利食い
+        sl_atr_mult: float = 2.0,   # -2×ATR で損切り
     ):
         self.period = period
         self.oversold = oversold
         self.overbought = overbought
         self.exit_level = exit_level
-        self.tp_pct = tp_pct
-        self.sl_pct = sl_pct
+        self.tp_atr_mult = tp_atr_mult
+        self.sl_atr_mult = sl_atr_mult
 
     def on_bar(self, df: pd.DataFrame, pos_dir: int = 0) -> Signal:
         if len(df) < self.period + 2:
@@ -163,8 +172,10 @@ class EMACrossStrategy(Strategy):
     - EMA200（価格との位置）で長期トレンドを判定し、トレンドに逆らうクロスを無視
     - 決済は逆シグナルでの反転（main.py 側で処理）＋ TP/SL 併用
 
-    tp_pct / sl_pct はエントリー価格に対する利食い・損切り幅（比率）。
+    TP/SL の幅は ATR（ボラティリティ）倍数（tp_atr_mult / sl_atr_mult）で表す。
+    リスク正規化のため、幅は銘柄のボラティリティに比例する。
     0 を指定するとその側の TP/SL を無効にする（main.py が参照する）。
+
     trend_filter=False にすると EMA200 フィルタなしの単純クロスになる。
     """
 
@@ -175,15 +186,15 @@ class EMACrossStrategy(Strategy):
         fast: int = 20,
         mid: int = 75,
         slow: int = 200,
-        tp_pct: float = 0.005,   # +0.5% で利食い
-        sl_pct: float = 0.003,   # -0.3% で損切り
+        tp_atr_mult: float = 3.0,    # +3×ATR で利食い
+        sl_atr_mult: float = 2.0,    # -2×ATR で損切り
         trend_filter: bool = True,
     ):
         self.fast = fast
         self.mid = mid
         self.slow = slow
-        self.tp_pct = tp_pct
-        self.sl_pct = sl_pct
+        self.tp_atr_mult = tp_atr_mult
+        self.sl_atr_mult = sl_atr_mult
         self.trend_filter = trend_filter
         # EMA(slow) の収束に十分な履歴本数。main.py が参照して取得本数を決める。
         self.min_history = slow + 100

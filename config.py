@@ -45,17 +45,27 @@ class Config:
     timeframe: str = "M5"
 
     # --- 注文 ---
-    lot: float = 0.01            # 固定ロット
+    lot: float = 0.01            # フォールバックロット（リスク算出不能時のみ使用）
     magic: int = 20261010        # このボットの注文を識別するマジックナンバー
     deviation: int = 20          # 許容スリッページ（ポイント）
+
+    # --- リスク管理（リスク正規化） ---
+    risk_percent: float = 0.01   # 1 トレードの最大損失を口座証拠金の何%にするか
+    atr_period: int = 14         # ATR の期間（ボラティリティ計測）
+
+    # --- 取引コスト（バックテスト用） ---
+    # 往復スプレッド想定を価格単位で指定（例: EURUSD なら 0.00012）。
+    # MT5 から取得する場合は銘柄の実スプレッドを自動で使うので、この値は
+    # CSV 検証や「スプレッドを固定して比較したい」ときのフォールバック/上書きに使う。
+    spread_price: float = 0.0
 
     # --- 戦略（EMA 20/75/200 クロス） ---
     ema_fast: int = 20            # 短期 EMA
     ema_mid: int = 75             # 中期 EMA
     ema_slow: int = 200           # 長期 EMA（トレンドフィルタ）
     ema_trend_filter: bool = True  # EMA200 で逆トレンドのクロスを抑止
-    ema_tp_pct: float = 0.005     # +0.5% で利食い
-    ema_sl_pct: float = 0.003     # -0.3% で損切り
+    ema_sl_atr: float = 2.0       # 損切り幅（ATR 倍数）
+    ema_tp_atr: float = 3.0       # 利食い幅（ATR 倍数）
 
     # --- レジーム判定（トレンド / レンジ） ---
     adx_period: int = 14           # ADX の期間
@@ -65,8 +75,8 @@ class Config:
     rsi_period: int = 14           # RSI の期間
     rsi_oversold: float = 30.0     # 売られすぎ（これ未満から反転で BUY）
     rsi_overbought: float = 70.0   # 買われすぎ（これ超えから反転で SELL）
-    range_tp_pct: float = 0.005    # +0.5% で利食い
-    range_sl_pct: float = 0.003    # -0.3% で損切り
+    range_sl_atr: float = 2.0      # 損切り幅（ATR 倍数）
+    range_tp_atr: float = 2.0      # 利食い幅（ATR 倍数）
 
     # --- メインループ ---
     poll_interval: float = 5.0   # 価格確認間隔（秒）

@@ -26,3 +26,6 @@ config_local.json
 .vscode/
 *.swp
 .DS_Store
+
+# --- Claude Code ローカル設定 ---
+.claude/

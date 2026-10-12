@@ -19,12 +19,16 @@
   "magic": 20261010,
   "deviation": 20,
 
+  "risk_percent": 0.01,
+  "atr_period": 14,
+  "spread_price": 0.0,
+
   "ema_fast": 20,
   "ema_mid": 75,
   "ema_slow": 200,
   "ema_trend_filter": true,
-  "ema_tp_pct": 0.005,
-  "ema_sl_pct": 0.003,
+  "ema_sl_atr": 2.0,
+  "ema_tp_atr": 3.0,
 
   "adx_period": 14,
   "adx_threshold": 25.0,
@@ -32,8 +36,8 @@
   "rsi_period": 14,
   "rsi_oversold": 30.0,
   "rsi_overbought": 70.0,
-  "range_tp_pct": 0.005,
-  "range_sl_pct": 0.003,
+  "range_sl_atr": 2.0,
+  "range_tp_atr": 2.0,
 
   "poll_interval": 5.0,
   "log_file": "mt5_autotrade.log"

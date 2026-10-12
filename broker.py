@@ -7,6 +7,7 @@ import math
 from typing import Optional
 
 import MetaTrader5 as mt5
+import numpy as np
 import pandas as pd
 
 from config import Config, timeframe_to_int
@@ -57,8 +58,46 @@ class MT5Broker:
         df["time"] = pd.to_datetime(df["time"], unit="s")
         return df
 
+    def get_history(self, symbol: str, max_bars: int = 50000) -> Optional[pd.DataFrame]:
+        """指定銘柄の履歴を可能な限り（最大 max_bars 本）ページング取得する。
+
+        copy_rates_from_pos は端末が同期済みの本数しか返さないため、count 刻みで
+        遡りながら取得し、時間昇順・重複除去して返す。バックテストのデータ源に使う。
+        """
+        step = 20000
+        chunks = []
+        start = 0
+        total = 0
+        log.info("履歴取得開始: %s（最大 %d 本）", symbol, max_bars)
+        while total < max_bars:
+            chunk = mt5.copy_rates_from_pos(symbol, self.timeframe, start, step)
+            if chunk is None or len(chunk) == 0:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            start += len(chunk)
+            log.info("履歴取得中: %s（%d 本取得）", symbol, total)
+            if len(chunk) < step:
+                break
+        if not chunks:
+            log.warning("履歴取得失敗: %s (%s)", symbol, mt5.last_error())
+            return None
+        rates = np.concatenate(chunks)
+        rates = rates[np.argsort(rates["time"])]
+        df = pd.DataFrame(rates).drop_duplicates(subset="time")
+        df["time"] = pd.to_datetime(df["time"], unit="s")
+        log.info("履歴取得完了: %s（%d 本）", symbol, len(df))
+        return df.reset_index(drop=True)
+
     def get_tick(self, symbol: str):
         return mt5.symbol_info_tick(symbol)
+
+    def symbol_spread_price(self, symbol: str) -> float:
+        """現在のスプレッドを価格単位で返す（往復コスト想定 = 1 スプレッド）。"""
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            return 0.0
+        return float(info.spread * info.point)
 
     def ensure_history(self, symbol: str, count: int = 3) -> None:
         """起動時の自己診断: 履歴データが取得できるか確認する。
@@ -104,6 +143,33 @@ class MT5Broker:
         return None
 
     # ---------- 注文 ----------
+    def account_equity(self) -> float:
+        """口座の現在の証拠金（equity）を返す。取得できなければ 0。"""
+        info = mt5.account_info()
+        return float(info.equity) if info is not None else 0.0
+
+    def compute_lot(self, symbol: str, entry_price: float, sl_price: float,
+                    risk_amount: float) -> float:
+        """リスク額からロットを逆算する（リスク正規化）。
+
+        - SL までの距離（価格幅）を 1 ティックの価値・サイズで換算し、
+          「1 ロットあたりの最大損失」を求める。
+        - risk_amount（口座通貨）をその損失で割ってロットを決める。
+        - ティック情報が無効な銘柄（trade_tick_size/value が 0）では
+          config.lot をフォールバックとして返す。
+        """
+        info = mt5.symbol_info(symbol)
+        tick_size = getattr(info, "trade_tick_size", 0.0) if info else 0.0
+        tick_value = getattr(info, "trade_tick_value", 0.0) if info else 0.0
+        distance = abs(entry_price - sl_price) if sl_price is not None else 0.0
+
+        if not tick_size or not tick_value or not distance or not risk_amount:
+            return self.normalize_lot(symbol, self.config.lot)
+
+        loss_per_lot = (distance / tick_size) * tick_value
+        lot = risk_amount / loss_per_lot
+        return self.normalize_lot(symbol, lot)
+
     def normalize_lot(self, symbol: str, lot: float) -> float:
         """lot を銘柄の volume_step の倍数・min/max 範囲に丸める。"""
         info = mt5.symbol_info(symbol)

@@ -16,7 +16,7 @@ class RSIRangeStrategy(Strategy):
     - RSI が買われすぎ(overbought)から反転下降 → SELL
     - 決済は TP/SL と逆向きシグナルでの反転（main.py 側で処理）
 
-    tp_pct / sl_pct はエントリー価格に対する利食い・損切り幅（比率、0 で無効）。
+    tp_atr_mult / sl_atr_mult は利食い・損切り幅（ATR 倍数、0 で無効）。
     """
 
     name = "range_rsi"
@@ -28,16 +28,16 @@ class RSIRangeStrategy(Strategy):
         overbought: float = 70.0,
         adx_period: int = 14,
         adx_threshold: float = 25.0,
-        tp_pct: float = 0.005,
-        sl_pct: float = 0.003,
+        tp_atr_mult: float = 2.0,
+        sl_atr_mult: float = 2.0,
     ):
         self.period = period
         self.oversold = oversold
         self.overbought = overbought
         self.adx_period = adx_period
         self.adx_threshold = adx_threshold
-        self.tp_pct = tp_pct
-        self.sl_pct = sl_pct
+        self.tp_atr_mult = tp_atr_mult
+        self.sl_atr_mult = sl_atr_mult
 
     def on_bar(self, df: pd.DataFrame, pos_dir: int = 0) -> Signal:
         if len(df) < self.period + 2:

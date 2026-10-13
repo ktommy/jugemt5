@@ -30,8 +30,9 @@ import numpy as np
 import pandas as pd
 
 from config import load_config
-from strategy import Signal, EMACrossStrategy, compute_atr, compute_adx, compute_rsi
+from strategy import Signal, Strategy, EMACrossStrategy, compute_atr, compute_adx, compute_rsi
 from range_strategy import RSIRangeStrategy
+from box_strategy import BoxRangeStrategy, box_levels, bb_width
 from regime import Regime, detect_regime
 
 log = logging.getLogger("backtest")
@@ -228,6 +229,9 @@ class _Indicators:
                  trade_tf: Optional[str] = None, regime_tf: Optional[str] = None):
         close = df["close"]
         self.close = close.to_numpy()
+        self.high = df["high"].to_numpy()
+        self.low = df["low"].to_numpy()
+        self.open = df["open"].to_numpy()
         self.ema_fast = close.ewm(span=getattr(trend, "fast", 20), adjust=False).mean().to_numpy()
         self.ema_mid = close.ewm(span=getattr(trend, "mid", 75), adjust=False).mean().to_numpy()
         self.ema_slow = close.ewm(span=getattr(trend, "slow", 200), adjust=False).mean().to_numpy()
@@ -239,6 +243,16 @@ class _Indicators:
             self.adx = compute_adx(df, adx_period).to_numpy()
         else:
             self.adx = _align_adx(df, regime_df, adx_period, trade_tf, regime_tf)
+        # ボックス戦略の内部 ADX フィルタ用（常に取引足。上位足対応付けはしない）。
+        # box_strategy の on_bar（compute_adx(df, strategy.adx_period)）と同一尺度にする。
+        self.box_adx = compute_adx(df, getattr(range_, "adx_period", adx_period)).to_numpy()
+        # ボックス戦略のドンチャンチャネル / BB 幅（見通し回避は box_levels 内の shift(1) で担保）
+        win = getattr(range_, "window", 20)
+        self.box_high, self.box_low, self.box_mid = box_levels(df, win)
+        self.box_high = self.box_high.to_numpy()
+        self.box_low = self.box_low.to_numpy()
+        self.box_mid = self.box_mid.to_numpy()
+        self.bb_width = bb_width(df, getattr(range_, "bb_period", 20)).to_numpy()
 
 
 def _ema_signal(ind: _Indicators, i: int, strategy: EMACrossStrategy) -> Signal:
@@ -263,6 +277,25 @@ def _rsi_range_signal(ind: _Indicators, i: int, strategy: RSIRangeStrategy) -> S
     if prev < strategy.oversold <= cur:
         return Signal.BUY
     if prev > strategy.overbought >= cur:
+        return Signal.SELL
+    return Signal.HOLD
+
+
+def _box_range_signal(ind: _Indicators, i: int, strategy: BoxRangeStrategy) -> Signal:
+    """BoxRangeStrategy.on_bar と同じ判定を、前計算済み指標から再現する。"""
+    if ind.box_adx[i] >= strategy.adx_threshold:
+        return Signal.HOLD
+    if strategy.use_bb_filter:
+        w = ind.bb_width[i]
+        if np.isnan(w) or w >= strategy.bb_width_threshold:
+            return Signal.HOLD
+    high = ind.box_high[i]
+    low = ind.box_low[i]
+    if np.isnan(high) or np.isnan(low):
+        return Signal.HOLD
+    if ind.low[i] <= low:
+        return Signal.BUY
+    if ind.high[i] >= high:
         return Signal.SELL
     return Signal.HOLD
 
@@ -310,6 +343,46 @@ def _open(bar, direction: int, atr: float, active, regime: Regime, index: int) -
 
     return _Pos(direction, entry, sl, tp, denom, bar["time"], index, regime,
                 getattr(active, "name", "strategy"))
+
+
+def _open_box(bar, direction: int, atr: float, active: BoxRangeStrategy,
+              regime: Regime, index: int, ind: _Indicators, i: int) -> _Pos:
+    """ボックス戦略の新規建て。指値約定（バンド到達）を再現する。
+
+    entry=バンド価格、TP=中央線、SL=バンド端±buffer×ATR、R 分母=buffer×ATR。
+    窓開けで open がバンドを越えていた場合は open で約定扱い（_check_stops の
+    ギャップ処理と同じ考え方）。TP/SL はエントリー時に固定し、追従はしない。
+    """
+    box_high = ind.box_high[i]
+    box_low = ind.box_low[i]
+    box_mid = ind.box_mid[i]
+    buffer = getattr(active, "sl_buffer_atr", 0.5) * atr
+    if direction == 1:
+        entry = min(float(bar["open"]), box_low)
+        if buffer > 0:
+            sl = box_low - buffer
+            denom = buffer
+        else:
+            sl = None
+            denom = atr
+    else:
+        entry = max(float(bar["open"]), box_high)
+        if buffer > 0:
+            sl = box_high + buffer
+            denom = buffer
+        else:
+            sl = None
+            denom = atr
+    return _Pos(direction, entry, sl, box_mid, denom, bar["time"], index, regime,
+                getattr(active, "name", "strategy"))
+
+
+def _open_pos(bar, direction: int, atr: float, active, regime: Regime,
+              index: int, ind: _Indicators, i: int) -> _Pos:
+    """戦略に応じた新規建て。ボックス戦略は指値（バンド）約定、他は ATR 倍数モデル。"""
+    if ind is not None and isinstance(active, BoxRangeStrategy):
+        return _open_box(bar, direction, atr, active, regime, index, ind, i)
+    return _open(bar, direction, atr, active, regime, index)
 
 
 def _close(pos: _Pos, bar, exit_px: float, reason: str, index: int,
@@ -361,7 +434,8 @@ def run(df: pd.DataFrame, symbol: str, trend_strategy, range_strategy,
 
     # 組み込み戦略ならベクトル計算パス、そうでなければ on_bar をそのまま呼ぶ
     vectorized = (isinstance(trend_strategy, EMACrossStrategy)
-                  and isinstance(range_strategy, RSIRangeStrategy))
+                  and isinstance(range_strategy, RSIRangeStrategy)) \
+        or isinstance(range_strategy, BoxRangeStrategy)
     ind = _Indicators(df, trend_strategy, range_strategy, adx_period, atr_period,
                       regime_df if vectorized else None, trade_tf, regime_tf) \
         if vectorized else None
@@ -383,6 +457,8 @@ def run(df: pd.DataFrame, symbol: str, trend_strategy, range_strategy,
         if vectorized:
             if isinstance(active, EMACrossStrategy):
                 return _ema_signal(ind, i, active)
+            if isinstance(active, BoxRangeStrategy):
+                return _box_range_signal(ind, i, active)
             return _rsi_range_signal(ind, i, active)
         return active.on_bar(completed, pos_dir)
 
@@ -411,9 +487,9 @@ def run(df: pd.DataFrame, symbol: str, trend_strategy, range_strategy,
             active = trend_strategy if regime == Regime.TREND else range_strategy
             signal = signal_at(i, active, 0, completed)
             if signal == Signal.BUY:
-                pos = _open(bar, 1, atr, active, regime, i)
+                pos = _open_pos(bar, 1, atr, active, regime, i, ind, i)
             elif signal == Signal.SELL:
-                pos = _open(bar, -1, atr, active, regime, i)
+                pos = _open_pos(bar, -1, atr, active, regime, i, ind, i)
         else:
             # --- 保有中: まずサーバー側 SL/TP を判定 ---
             exit_px, reason = _check_stops(pos, bar)
@@ -435,7 +511,7 @@ def run(df: pd.DataFrame, symbol: str, trend_strategy, range_strategy,
             if reverse:
                 trades.append(_close(pos, bar, bar["close"], "REVERSAL", i, spread_price))
                 atr = atr_at(i) if vectorized else _atr(completed, atr_period)
-                pos = _open(bar, -pos.direction, atr, active, regime, i) if atr else None
+                pos = _open_pos(bar, -pos.direction, atr, active, regime, i, ind, i) if atr else None
 
     # データ末尾で未決済ポジションを時価評価決済
     if pos is not None:
@@ -476,6 +552,16 @@ def save_trades(trades: List[Trade], out_path: str) -> None:
 
 # ---------- CLI ----------
 
+class _HoldStrategy(Strategy):
+    """常に HOLD を返す無動作戦略。単一戦略検証で使われない側に渡す。"""
+
+    name = "hold"
+    min_history = 0
+
+    def on_bar(self, df, pos_dir: int = 0) -> Signal:
+        return Signal.HOLD
+
+
 def build_strategies(cfg, trend_tp=None, trend_sl=None,
                      range_tp=None, range_sl=None):
     """config から2戦略を生成。TP/SL 倍数は引数で上書きできる（スイープ用）。"""
@@ -495,8 +581,26 @@ def build_strategies(cfg, trend_tp=None, trend_sl=None,
     return trend, range_
 
 
+def build_box_strategy(cfg) -> BoxRangeStrategy:
+    """config からボックスレンジ逆張り戦略を生成（単一戦略検証用）。"""
+    return BoxRangeStrategy(
+        window=cfg.box_window,
+        adx_period=cfg.adx_period,
+        adx_threshold=cfg.adx_threshold,
+        use_bb_filter=cfg.box_bb_filter,
+        bb_period=cfg.box_bb_period,
+        bb_width_threshold=cfg.box_bb_width,
+        sl_buffer_atr=cfg.box_sl_buffer_atr,
+        min_mid_atr=cfg.box_min_mid_atr,
+    )
+
+
 def _parse_csv_floats(text: str) -> List[float]:
     return [float(x) for x in text.split(",") if x.strip()]
+
+
+def _parse_csv_ints(text: str) -> List[int]:
+    return [int(x) for x in text.split(",") if x.strip()]
 
 
 def _span_of(df) -> str:
@@ -603,6 +707,78 @@ def _run_sweep(args, broker, cfg, symbols, start=None, end=None) -> List[Trade]:
     return []  # スイープはトレード履歴の保存対象ではない
 
 
+def _run_box_sweep(args, broker, cfg, symbols, start=None, end=None) -> List[Trade]:
+    """ボックス戦略のパラメータ総当たり（window × sl_buffer_atr）。
+
+    レジームを range に固定し、ドンチャン窓（ボックス幅）と SL バッファ（ATR 倍数）を
+    総当たりで測る。BB 幅フィルタ・ADX 閾値など残りは config 値のまま（`--box-no-bb` で
+    BB フィルタのみ無効化できる）。spread は実値（または --spread 固定値）を控除する。
+    """
+    windows = _parse_csv_ints(args.box_windows)
+    buffers = _parse_csv_floats(args.box_buffers)
+
+    # データは1回ずつ取得してキャッシュ（スイープ中に何度も取得しないため）
+    dfs, spreads = {}, {}
+    for sym in symbols:
+        df = _fetch_df(args, broker, sym, start, end)
+        if df is None or len(df) < 60:
+            log.warning("履歴なし/不足: %s（%s 本）", sym, 0 if df is None else len(df))
+            continue
+        dfs[sym] = df
+        spreads[sym] = _spread_for(args, broker, sym, cfg)
+    if not dfs:
+        return []
+
+    rng = ""
+    if start is not None or end is not None:
+        a = start.strftime("%Y-%m-%d") if start is not None else "…"
+        b = end.strftime("%Y-%m-%d") if end is not None else "…"
+        rng = f" / 指定 {a}〜{b}"
+    lo = min((df["time"].min() for df in dfs.values()), default=None)
+    hi = max((df["time"].max() for df in dfs.values()), default=None)
+    span = ""
+    if lo is not None:
+        span = f" / 実データ {pd.Timestamp(lo).strftime('%Y-%m-%d')}〜{pd.Timestamp(hi).strftime('%Y-%m-%d')}"
+    bb_note = "BB無効" if args.box_no_bb else f"BB<{cfg.box_bb_width}"
+    header = (f"=== box-sweep [window × sl_buffer]（{cfg.timeframe} / {len(dfs)}銘柄合算"
+              f"{span}{rng} / ADX<{cfg.adx_threshold} / {bb_note}） ===")
+    if args.source == "mt5" and args.spread is None:
+        header += " ※実スプレッド込み"
+    print(header)
+    for win in windows:
+        for buf in buffers:
+            box = BoxRangeStrategy(
+                window=win,
+                adx_period=cfg.adx_period,
+                adx_threshold=cfg.adx_threshold,
+                use_bb_filter=not args.box_no_bb,
+                bb_period=cfg.box_bb_period,
+                bb_width_threshold=cfg.box_bb_width,
+                sl_buffer_atr=buf,
+                min_mid_atr=cfg.box_min_mid_atr,
+            )
+            combo: List[Trade] = []
+            per_sym = {}
+            for sym, df in dfs.items():
+                tt = run(df, sym, _HoldStrategy(), box,
+                         cfg.adx_period, cfg.adx_threshold, cfg.atr_period,
+                         spread_price=spreads[sym], force_regime="range")
+                combo.extend(tt)
+                per_sym[sym] = tt
+            s = summarize(combo)
+            pf = f"{s.pf:.2f}" if s.pf != float("inf") else "∞"
+            print(f"  window={win:2d} buffer={buf:.2f}  件数 {s.n:4d}  勝率 {s.win_rate:5.1%}  "
+                  f"平均R {s.avg_r:+6.3f}  PF {pf}  合計R {s.total_r:+8.1f}")
+            if len(dfs) > 1:
+                # 銘柄別の内訳（合計R 降順）。エッジが特定銘柄の偏りかを見る
+                for sym, tt in sorted(per_sym.items(),
+                                      key=lambda kv: summarize(kv[1]).total_r, reverse=True):
+                    ss = summarize(tt)
+                    print(f"      {sym:<8} 件数 {ss.n:4d}  平均R {ss.avg_r:+6.3f}  "
+                          f"合計R {ss.total_r:+8.1f}")
+    return []  # スイープはトレード履歴の保存対象ではない
+
+
 def main(argv=None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     parser = argparse.ArgumentParser(description="MT5 bot のバックテスター")
@@ -621,6 +797,16 @@ def main(argv=None) -> None:
                         help="TP/SL 倍数を総当たりでバックテスト（force_regime で単一戦略を固定）")
     parser.add_argument("--sweep-strategy", choices=["trend", "range"], default="trend",
                         help="スイープ対象の戦略（trend=EMAクロス / range=RSI逆張り）")
+    parser.add_argument("--box", action="store_true",
+                        help="ボックスレンジ逆張り戦略を単一戦略で検証（レジーム切替なし・指値約定）")
+    parser.add_argument("--box-sweep", action="store_true",
+                        help="ボックス戦略のパラメータ総当たり（window × sl_buffer_atr）")
+    parser.add_argument("--box-windows", default="10,20,30,40",
+                        help="box-sweep するドンチャン窓（window）のカンマ区切りリスト")
+    parser.add_argument("--box-buffers", default="0.5,1.0,1.5,2.0",
+                        help="box-sweep する SL バッファ（ATR 倍数）のカンマ区切りリスト")
+    parser.add_argument("--box-no-bb", action="store_true",
+                        help="box-sweep で BB 幅フィルタを無効にする（全 combo 共通）")
     parser.add_argument("--sweep-tp", default="2.0,3.0,4.0,5.0",
                         help="スイープする TP（ATR倍数）のカンマ区切りリスト")
     parser.add_argument("--sweep-sl", default="2.0",
@@ -641,13 +827,19 @@ def main(argv=None) -> None:
     if start is not None or end is not None:
         log.info("期間を絞る: %s 〜 %s", args.start or "…", args.end or "…")
     symbols = [args.symbol] if args.symbol else list(cfg.symbols)
-    trend, range_ = build_strategies(cfg)
+    if args.box:
+        trend, range_ = _HoldStrategy(), build_box_strategy(cfg)
+        log.info("ボックスレンジ逆張り戦略（単一戦略・指値約定）で検証します")
+    else:
+        trend, range_ = build_strategies(cfg)
 
     # レジーム判定の上位時間足（シグナルは cfg.timeframe のまま）
     trade_tf = cfg.timeframe
     regime_tf_raw = args.regime_timeframe if args.regime_timeframe is not None else cfg.regime_timeframe
     regime_tf = (regime_tf_raw or "").strip() or trade_tf
     multi_tf = regime_tf.upper() != trade_tf.upper()
+    if args.box:
+        multi_tf = False   # ボックス戦略は取引足の ADX で判定（上位足レジームは使わない）
     if multi_tf and args.source != "mt5":
         log.warning("CSV は単一時間足のみ。上位TFレジーム（%s）は使わず %s で判定します", regime_tf, trade_tf)
         regime_tf = trade_tf
@@ -669,6 +861,14 @@ def main(argv=None) -> None:
     if args.sweep:
         try:
             _run_sweep(args, broker, cfg, symbols, start, end)
+        finally:
+            if broker is not None:
+                broker.disconnect()
+        return
+
+    if args.box_sweep:
+        try:
+            _run_box_sweep(args, broker, cfg, symbols, start, end)
         finally:
             if broker is not None:
                 broker.disconnect()
@@ -696,7 +896,8 @@ def main(argv=None) -> None:
             trades = run(df, sym, trend, range_,
                          cfg.adx_period, cfg.adx_threshold, cfg.atr_period,
                          spread_price=spread_price,
-                         regime_df=regime_df,
+                         force_regime="range" if args.box else None,
+                         regime_df=None if args.box else regime_df,
                          trade_tf=trade_tf, regime_tf=regime_tf)
             print_summary(sym, summarize(trades), _span_of(df))
             all_trades.extend(trades)

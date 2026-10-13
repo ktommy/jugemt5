@@ -84,6 +84,14 @@ class Config:
     range_sl_atr: float = 2.0      # 損切り幅（ATR 倍数）
     range_tp_atr: float = 2.0      # 利食い幅（ATR 倍数）
 
+    # --- ボックスレンジ逆張り戦略（ドンチャンチャネル） ---
+    box_window: int = 20            # ドンチャンチャネルの期間（ボックス幅）
+    box_sl_buffer_atr: float = 0.5  # 損切りバッファ（バンド端±この ATR 倍数）
+    box_bb_filter: bool = True      # ボリンジャーバンド幅フィルタを使うか
+    box_bb_period: int = 20         # BB の期間
+    box_bb_width: float = 0.05      # これ未満のバンド幅をレンジとみなす
+    box_min_mid_atr: float = 0.0    # TP(中央線)距離がこの ATR 倍数未満なら見送り（0=無効）
+
     # --- メインループ ---
     poll_interval: float = 5.0   # 価格確認間隔（秒）
 

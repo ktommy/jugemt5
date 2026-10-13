@@ -82,6 +82,16 @@ class Strategy(ABC):
         """最新の確定足データと現在ポジションから次のアクションを返す。"""
         raise NotImplementedError
 
+    def exit_plan(self, df: pd.DataFrame, direction: int, atr: float):
+        """新規建て時の (entry_px, sl_px, tp_px, denom) を返す任意の拡張。
+
+        デフォルトは None（main.py / backtest.py が従来の ATR 倍数モデルを使う）。
+        TP/SL がエントリー価格から非対称・可変になる戦略（ボックス逆張りなど）は
+        これをオーバーライドして絶対価格と R 分母を返す。
+        direction: +1=買い / -1=売り。denom は R（リスク倍数）の分母。
+        """
+        return None
+
 
 class MACrossStrategy(Strategy):
     """移動平均クロス戦略（サンプル実装）。

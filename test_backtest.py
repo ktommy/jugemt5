@@ -10,10 +10,11 @@ import pandas as pd
 
 from strategy import Strategy, Signal, EMACrossStrategy, compute_adx
 from range_strategy import RSIRangeStrategy
+from box_strategy import BoxRangeStrategy
 from regime import Regime
 from backtest import (
-    run, summarize, Trade, _Pos, _check_stops,
-    _Indicators, _ema_signal, _rsi_range_signal, _align_adx,
+    run, summarize, Trade, _Pos, _check_stops, _HoldStrategy,
+    _Indicators, _ema_signal, _rsi_range_signal, _box_range_signal, _align_adx,
 )
 
 
@@ -264,6 +265,30 @@ class AlignTest(unittest.TestCase):
         self.assertEqual(out[163], reg_adx[53])   # 完成済みの 13:15 を採用
         self.assertLess(out[163], 25.0)           # → レンジ（ADX 低）
         self.assertGreaterEqual(reg_adx[54], 25.0)  # 形成中の 13:30 はトレンドなのに参照されない
+
+
+class BoxVectorizedTest(unittest.TestCase):
+    """ボックス戦略のベクトル計算パス（_box_range_signal）が on_bar と完全一致することを担保する。"""
+
+    def test_box_signal_matches_on_bar(self):
+        np.random.seed(11)
+        n = 1500
+        close = 100.0 + np.cumsum(np.random.normal(0, 0.25, n))
+        high = close + np.abs(np.random.normal(0, 0.2, n))
+        low = close - np.abs(np.random.normal(0, 0.2, n))
+        open_ = np.roll(close, 1)
+        open_[0] = close[0]
+        df = pd.DataFrame({
+            "time": pd.date_range("2026-01-01", periods=n, freq="5min"),
+            "open": open_, "high": high, "low": low, "close": close,
+        })
+        box = BoxRangeStrategy()
+        ind = _Indicators(df, HoldStrategy(), box, 14, 14)
+        warmup = max(box.min_history, 14, 14) + 2
+        for i in range(warmup, n):
+            ref = df.iloc[: i + 1]
+            self.assertEqual(_box_range_signal(ind, i, box),
+                             box.on_bar(ref, 0), f"box @{i}")
 
 
 class SummarizeTest(unittest.TestCase):

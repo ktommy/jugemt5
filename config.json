@@ -40,6 +40,13 @@
   "range_sl_atr": 2.0,
   "range_tp_atr": 2.0,
 
+  "box_window": 20,
+  "box_sl_buffer_atr": 0.5,
+  "box_bb_filter": true,
+  "box_bb_period": 20,
+  "box_bb_width": 0.05,
+  "box_min_mid_atr": 0.0,
+
   "poll_interval": 5.0,
   "log_file": "mt5_autotrade.log"
 }

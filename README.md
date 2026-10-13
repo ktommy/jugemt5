@@ -23,6 +23,7 @@ MetaTrader5 公式 Python API を使った、差し替え可能な自動売買�
 | `config.py` | 設定の読込（`config.json` → `Config`）と型・既定値の定義 |
 | `strategy.py` | 戦略インターフェース + トレンド戦略（EMA20/75/200クロス）と指数計算（RSI/ADX） |
 | `range_strategy.py` | レンジ戦略（RSI逆張り + ADXフィルタ）。同じ Strategy インターフェース |
+| `box_strategy.py` | ボックスレンジ逆張り戦略（ドンチャンチャネル）。`--box` で単一戦略検証 |
 | `regime.py` | 相場判定（ADX からトレンド/レンジを判定） |
 | `selector.py` | 候補銘柄の選別（シグナル発火ベースで稼げそうな銘柄を選ぶ） |
 | `broker.py` | MT5 接続・レート取得・発注・決済・ポジション管理・起動時自己診断 |
@@ -33,6 +34,7 @@ MetaTrader5 公式 Python API を使った、差し替え可能な自動売買�
 | `test_regime.py` | レジーム判定・レンジ戦略のユニットテスト |
 | `test_selector.py` | 銘柄選別（selector.py）のユニットテスト |
 | `test_backtest.py` | バックテスターエンジンのユニットテスト |
+| `test_box_strategy.py` | ボックスレンジ逆張り戦略のユニットテスト |
 | `requirements.txt` | 依存関係 |
 | `README.md` | 本ドキュメント |
 
@@ -100,6 +102,12 @@ MT5 の Python API は、**端末がローカルに保持している履歴デ�
 | `rsi_overbought` | `70.0` | 買われすぎ（これ超えからの反転で SELL） |
 | `range_sl_atr` | `2.0` | レンジ戦略の損切り幅（ATR 倍数、`0` で無効） |
 | `range_tp_atr` | `2.0` | レンジ戦略の利食い幅（ATR 倍数、`0` で無効） |
+| `box_window` | `20` | ボックス戦略のドンチャンチャネル期間（ボックス幅） |
+| `box_sl_buffer_atr` | `0.5` | ボックス戦略の損切りバッファ（バンド端±この ATR 倍数） |
+| `box_bb_filter` | `true` | ボックス戦略のボリンジャーバンド幅フィルタを使うか |
+| `box_bb_period` | `20` | ボックス戦略の BB 期間 |
+| `box_bb_width` | `0.05` | これ未満のバンド幅をレンジとみなす |
+| `box_min_mid_atr` | `0.0` | TP（中央線）距離がこの ATR 倍数未満なら見送り（`0`=無効） |
 | `poll_interval` | `5.0` | 価格確認間隔（秒） |
 | `log_file` | `"mt5_autotrade.log"` | ログ出力先ファイル |
 
@@ -149,6 +157,20 @@ MT5 の Python API は、**端末がローカルに保持している履歴デ�
 | RSI が買われすぎ(70)を上から下に抜けて反転 | `SELL` | 売り |
 | ADX が閾値以上（トレンド） | `HOLD` | 見送り |
 | それ以外 | `HOLD` | 何もしない |
+
+### ボックスレンジ逆張り戦略（検証中）
+
+`box_strategy.py` の `BoxRangeStrategy` が担当します。レンジ（ボックス）の上限/下限へ指値で逆張りします（`--box` で単一戦略として検証）。仕様は [`SPEC_BOX_STRATEGY.md`](SPEC_BOX_STRATEGY.md) を参照。
+
+| 条件 | シグナル | 動作 |
+|---|---|---|
+| ADX 低 **かつ** BB 幅狭（レンジ判定）で、安値が Box_Low をタッチ | `BUY` | Box_Low に指値買い |
+| 同上で、高値が Box_High をタッチ | `SELL` | Box_High に指値売り |
+| ADX 高または BB 幅広（トレンド） | `HOLD` | 見送り |
+
+- **決済**: TP = Box_Mid（中央線）、SL = バンド端 ± `box_sl_buffer_atr`×ATR。エントリー時に固定（追従なし）。
+- **指値約定**: バックテストでは「バンド到達で約定、窓開けは open で約定」を再現します（成行の close 約定ではない）。
+- Box の計算は `.shift(1)` で見通しバイアスを排除しています。
 
 ### 発注時の挙動
 
@@ -260,6 +282,11 @@ MT5 端末の履歴は同期済みの本数に依存します。**短い時間�
 | `--sweep-strategy` | `trend` | スイープ対象の戦略（`trend`=EMAクロス / `range`=RSI逆張り） |
 | `--sweep-tp` | `2.0,3.0,4.0,5.0` | スイープする TP（ATR 倍数）のカンマ区切りリスト |
 | `--sweep-sl` | `2.0` | スイープする SL（ATR 倍数）のカンマ区切りリスト |
+| `--box` | （無効） | ボックスレンジ逆張り戦略を単一戦略で検証（レジーム切替なし・指値約定） |
+| `--box-sweep` | （無効） | ボックス戦略のパラメータ総当たり（`window` × `sl_buffer_atr`） |
+| `--box-windows` | `10,20,30,40` | box-sweep するドンチャン窓（`window`）のカンマ区切りリスト |
+| `--box-buffers` | `0.5,1.0,1.5,2.0` | box-sweep する SL バッファ（ATR 倍数）のカンマ区切りリスト |
+| `--box-no-bb` | （無効） | box-sweep で BB 幅フィルタを無効にする（全 combo 共通） |
 | `--start` | （全期間） | 開始日（`YYYY-MM-DD`）。この日以降のデータだけで検証（前後半に分けた再現性確認用） |
 | `--end` | （全期間） | 終了日（`YYYY-MM-DD`）。この日以前のデータだけで検証 |
 | `--out` | `backtest_trades.csv` | トレード履歴の出力先 |
@@ -298,6 +325,37 @@ MT5 端末の履歴は同期済みの本数に依存します。**短い時間�
 **複数銘柄でスイープした場合**、各 (TP, SL) セルの下に**銘柄別の内訳**（平均R・合計R・件数、合計R 降順）が並びます。
 「合算ではプラスでも、実は BTCUSD など 1 銘柄の単調ドリフトが稼いでいて、残りは負け」といった偏りが見えるため、
 プラスが出たときは必ずこの内訳で「全銘柄に効くのか、特定銘柄の偏りなのか」を確認してください。単一銘柄（`--symbol`）指定時は内訳を出しません。
+
+### ボックス戦略スイープ（パラメータ総当たり）
+
+ボックス戦略（`--box`）は TP/SL を ATR 倍数で持たず、ドンチャン窓と SL バッファで価格構造が決まるため、
+既存 `--sweep`（TP×SL）とは別に専用の `--box-sweep` を用意しています。**窓（`window`）と SL バッファ（`sl_buffer_atr`）**を総当たりし、BB 幅フィルタ・ADX 閾値など残りは config 値のままです。
+
+```powershell
+# window と SL バッファを総当たり（H1・実スプレッド込み）
+.\venv\Scripts\python.exe backtest.py --box-sweep --timeframe H1 --symbol EURUSD
+
+# スプレッドを 0 にして「グロス（控除前）の期待値」だけを見る（エッジ有無の確認）
+.\venv\Scripts\python.exe backtest.py --box-sweep --timeframe H1 --symbol EURUSD --spread 0
+
+# BB 幅フィルタを無効化して比較
+.\venv\Scripts\python.exe backtest.py --box-sweep --timeframe H1 --symbol EURUSD --box-no-bb
+```
+
+出力例:
+
+```
+=== box-sweep [window × sl_buffer]（H1 / 1銘柄合算 / 実データ ... / ADX<25.0 / BB<0.05） === ※実スプレッド込み
+  window=10 buffer=0.50  件数  120  勝率  30.0%  平均R -0.210  PF 0.60  合計R   -25.2
+  window=20 buffer=1.00  件数   90  勝率  33.0%  平均R -0.150  PF 0.68  合計R   -13.5
+  ...
+```
+
+読み方のポイント:
+
+- **buffer を広げると `平均R` が（マイナスのまま）上方向へ動く**のは、ほぼ「スプレッドの R 換算が減る」だけです。真のエッジ有無は `--spread 0` で**グロスがプラスになるか**を見ます。
+- グロスが全 combo で ±0 付近なら、それは「勝率が損益分岐勝率ちょうどに張り付く＝方向予測力ゼロ」のサインで、EMA/RSI と同じ結論です。パラメータ調整では勝ちに転じません。
+- 期間分割（`--start`/`--end`）と併用して、プラスに見える combo が後半でも再現するかを必ず確認してください（過学習対策）。
 
 ### 成績の読み方
 

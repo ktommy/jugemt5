@@ -92,6 +92,14 @@ class Config:
     box_bb_width: float = 0.05      # これ未満のバンド幅をレンジとみなす
     box_min_mid_atr: float = 0.0    # TP(中央線)距離がこの ATR 倍数未満なら見送り（0=無効）
 
+    # --- 通貨強弱（相対モメンタム）戦略 ---
+    momentum_lookback: int = 24        # 変化率の算出期間（本数。H1 足なら 24=24時間）
+    momentum_threshold: float = 0.5    # 最強/最弱ペアを取引する最低スコア差（%）
+    momentum_exit_threshold: float = 0.3  # 保有中にスコア差がこれを下回ったらクローズ（%）
+    momentum_exit: bool = True         # ランキング崩れ/スコア差縮小でのクローズを使うか
+    momentum_sl_atr: float = 2.0       # 損切り幅（ATR 倍数、0 で無効）
+    momentum_tp_atr: float = 3.0       # 利食い幅（ATR 倍数、0 で無効）
+
     # --- メインループ ---
     poll_interval: float = 5.0   # 価格確認間隔（秒）
 

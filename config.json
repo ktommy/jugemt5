@@ -47,6 +47,13 @@
   "box_bb_width": 0.05,
   "box_min_mid_atr": 0.0,
 
+  "momentum_lookback": 24,
+  "momentum_threshold": 0.5,
+  "momentum_exit_threshold": 0.3,
+  "momentum_exit": true,
+  "momentum_sl_atr": 2.0,
+  "momentum_tp_atr": 3.0,
+
   "poll_interval": 5.0,
   "log_file": "mt5_autotrade.log"
 }

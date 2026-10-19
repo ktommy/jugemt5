@@ -12,6 +12,7 @@ from strategy import compute_adx
 class Regime(Enum):
     TREND = "trend"
     RANGE = "range"
+    MOMENTUM = "momentum"   # 通貨強弱戦略（レジーム概念なし）のトレードを区別するための値
 
 
 def detect_regime(df: pd.DataFrame, adx_period: int = 14,

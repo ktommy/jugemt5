@@ -34,6 +34,10 @@ from strategy import Signal, Strategy, EMACrossStrategy, compute_atr, compute_ad
 from range_strategy import RSIRangeStrategy
 from box_strategy import BoxRangeStrategy, box_levels, bb_width
 from regime import Regime, detect_regime
+from currency_momentum import (
+    CurrencyMomentumStrategy, change_pct, scores_from_chg, rank_currencies,
+    split_pair, PAIRS,
+)
 
 log = logging.getLogger("backtest")
 
@@ -523,6 +527,147 @@ def run(df: pd.DataFrame, symbol: str, trend_strategy, range_strategy,
     return trades
 
 
+def run_currency_momentum(dfs, momentum: CurrencyMomentumStrategy,
+                          atr_period: int = 14,
+                          spread_prices: Optional[dict] = None) -> List[Trade]:
+    """複数銘柄を横断して通貨強弱（相対モメンタム）戦略をシミュレートする。
+
+    dfs: {symbol: DataFrame(time,open,high,low,close)}。全銘柄の足を時間軸で突き合わせ、
+    各時点の通貨ランキング（最強/最弱）を全銘柄で共有しつつ、各銘柄の構成通貨が
+    「最強×最弱」の組み合わせに一致したときだけ、その銘柄でエントリーする。
+
+    - ロング（base買い）: base=最強 かつ quote=最弱
+    - ショート（base売り）: base=最弱 かつ quote=最強
+    - スコア差が momentum_threshold を超えるときのみ取引対象
+
+    見通しバイアス回避: 変化率は各銘柄の close を lookback 本だけ過去へ shift して
+    比較する .pct_change で求め、さらに共通時間軸へ「完成済みの足だけ」を
+    フォワードフィルで対応付ける（未来の足・形成中の足を覗かない）。
+
+    TP/SL は既存と同じ ATR 倍数モデル。momentum.use_momentum_exit が True なら、
+    最強×最弱の組み合わせが崩れた、またはスコア差が exit_threshold 以下になった時点で
+    シグナルクローズ（exit_reason="MOMENTUM"）する。
+    """
+    spreads = spread_prices or {}
+    syms = [s for s in dfs if s in PAIRS]
+    if len(syms) < 2:
+        log.warning("通貨強弱戦略には2ペア以上が必要です（現在 %d）", len(syms))
+        return []
+
+    # 全部の銘柄の足開始時刻の和集合を共通時間軸とする
+    common = pd.DatetimeIndex(sorted(set().union(*(set(df["time"]) for df in dfs.values()))))
+    n = len(common)
+
+    # 銘柄ごとの配列を共通時間軸に整列する
+    bars = {}
+    for sym in syms:
+        df_sym = dfs[sym]
+        t = pd.DatetimeIndex(df_sym["time"])
+        left = t.searchsorted(common, side="left")
+        right = t.searchsorted(common, side="right")
+        has_bar = right != left                                    # common[i] に自銘柄の足があるか
+        ffill_idx = right - 1                                      # common[i] 時点で完成済みの最新足
+        ffill_ok = ffill_idx >= 0
+
+        chg = change_pct(df_sym, momentum.lookback_period).to_numpy()
+        atr = compute_atr(df_sym, atr_period).to_numpy()
+
+        chg_state = np.full(n, np.nan)
+        chg_state[ffill_ok] = chg[ffill_idx[ffill_ok]]
+        atr_state = np.full(n, np.nan)
+        atr_state[ffill_ok] = atr[ffill_idx[ffill_ok]]
+
+        o = df_sym["open"].to_numpy()
+        h = df_sym["high"].to_numpy()
+        l = df_sym["low"].to_numpy()
+        c = df_sym["close"].to_numpy()
+        bar_o = np.full(n, np.nan); bar_o[has_bar] = o[left[has_bar]]
+        bar_h = np.full(n, np.nan); bar_h[has_bar] = h[left[has_bar]]
+        bar_l = np.full(n, np.nan); bar_l[has_bar] = l[left[has_bar]]
+        bar_c = np.full(n, np.nan); bar_c[has_bar] = c[left[has_bar]]
+
+        bars[sym] = dict(has_bar=has_bar, open=bar_o, high=bar_h, low=bar_l,
+                         close=bar_c, chg=chg_state, atr=atr_state)
+
+    def _signal(sym, strong, weak, diff) -> bool:
+        """この銘柄が最強×最弱の組み合わせに該当するか（しきい値込み）。"""
+        if strong is None or weak is None or diff is None:
+            return False
+        if diff <= momentum.momentum_threshold:
+            return False
+        base, quote = split_pair(sym)
+        if strong == base and weak == quote:
+            return +1
+        if strong == quote and weak == base:
+            return -1
+        return 0
+
+    def _still_holds(pos: _Pos, sym, strong, weak) -> bool:
+        base, quote = split_pair(sym)
+        if pos.direction == 1:
+            return strong == base and weak == quote
+        return strong == quote and weak == base
+
+    exit_thr = momentum.exit_threshold if momentum.exit_threshold is not None \
+        else momentum.momentum_threshold
+
+    positions = {sym: None for sym in syms}
+    trades: List[Trade] = []
+
+    for i in range(n):
+        chg_at = {sym: bars[sym]["chg"][i] for sym in syms}
+        ranked = rank_currencies(scores_from_chg(chg_at))
+        strong = weak = diff = None
+        if ranked is not None:
+            strong, weak, diff = ranked
+
+        for sym in syms:
+            b = bars[sym]
+            if not b["has_bar"][i]:
+                continue
+            bar = pd.Series({"time": common[i], "open": b["open"][i],
+                             "high": b["high"][i], "low": b["low"][i],
+                             "close": b["close"][i]})
+            spread = spreads.get(sym, 0.0)
+            pos = positions[sym]
+
+            if pos is None:
+                direction = _signal(sym, strong, weak, diff)
+                if direction == 0:
+                    continue
+                atr = b["atr"][i]
+                if not np.isfinite(atr) or atr <= 0:
+                    continue
+                positions[sym] = _open(bar, direction, float(atr), momentum,
+                                       Regime.MOMENTUM, i)
+            else:
+                exit_px, reason = _check_stops(pos, bar)
+                if reason is not None:
+                    t = _close(pos, bar, exit_px, reason, i, spread)
+                    t.symbol = sym
+                    trades.append(t)
+                    positions[sym] = None
+                    continue
+                if momentum.use_momentum_exit and diff is not None:
+                    if not _still_holds(pos, sym, strong, weak) or diff <= exit_thr:
+                        t = _close(pos, bar, float(bar["close"]), "MOMENTUM", i, spread)
+                        t.symbol = sym
+                        trades.append(t)
+                        positions[sym] = None
+
+    # データ末尾で未決済ポジションを時価評価決済
+    for sym in syms:
+        pos = positions[sym]
+        if pos is not None:
+            last = dfs[sym].iloc[-1]
+            spread = spreads.get(sym, 0.0)
+            t = _close(pos, last, float(last["close"]), "EOD", n - 1, spread)
+            t.symbol = sym
+            trades.append(t)
+
+    return trades
+
+
 # ---------- 出力 ----------
 
 def print_summary(symbol: str, s: Summary, span: str = None) -> None:
@@ -592,6 +737,20 @@ def build_box_strategy(cfg) -> BoxRangeStrategy:
         bb_width_threshold=cfg.box_bb_width,
         sl_buffer_atr=cfg.box_sl_buffer_atr,
         min_mid_atr=cfg.box_min_mid_atr,
+    )
+
+
+def build_momentum_strategy(cfg, lookback=None, threshold=None,
+                            exit_threshold=None, use_momentum_exit=None,
+                            sl_atr=None, tp_atr=None) -> CurrencyMomentumStrategy:
+    """config から通貨強弱（相対モメンタム）戦略を生成。各値は引数で上書き可。"""
+    return CurrencyMomentumStrategy(
+        lookback_period=cfg.momentum_lookback if lookback is None else lookback,
+        momentum_threshold=cfg.momentum_threshold if threshold is None else threshold,
+        exit_threshold=cfg.momentum_exit_threshold if exit_threshold is None else exit_threshold,
+        use_momentum_exit=cfg.momentum_exit if use_momentum_exit is None else use_momentum_exit,
+        sl_atr_mult=cfg.momentum_sl_atr if sl_atr is None else sl_atr,
+        tp_atr_mult=cfg.momentum_tp_atr if tp_atr is None else tp_atr,
     )
 
 
@@ -779,6 +938,64 @@ def _run_box_sweep(args, broker, cfg, symbols, start=None, end=None) -> List[Tra
     return []  # スイープはトレード履歴の保存対象ではない
 
 
+def _run_momentum(args, broker, cfg, symbols, start=None, end=None) -> List[Trade]:
+    """通貨強弱（相対モメンタム）戦略の全銘柄横断バックテスト。
+
+    全ペアを同一時間足（cfg.timeframe）で取得し、run_currency_momentum に渡して
+    通貨ランキングベースの取引をシミュレートする。スプレッドは実値（または
+    --spread 固定値、CSV なら config.spread_price）を控除する。
+    """
+    momentum = build_momentum_strategy(
+        cfg,
+        lookback=args.momentum_lookback,
+        threshold=args.momentum_threshold,
+        exit_threshold=args.momentum_exit_threshold,
+        use_momentum_exit=False if args.momentum_no_exit else None,
+    )
+    dfs, spreads = {}, {}
+    for sym in symbols:
+        df = _fetch_df(args, broker, sym, start, end, timeframe=cfg.timeframe)
+        if df is None or len(df) < momentum.min_history:
+            log.warning("履歴なし/不足: %s（%s 本）", sym, 0 if df is None else len(df))
+            continue
+        dfs[sym] = df
+        spreads[sym] = _spread_for(args, broker, sym, cfg)
+    if len(dfs) < 2:
+        log.warning("通貨強弱戦略に十分な銘柄がありません（%d ペア）", len(dfs))
+        return []
+
+    header = (f"=== currency-momentum（{cfg.timeframe} / {len(dfs)}ペア横断"
+              f" / lookback={momentum.lookback_period} threshold={momentum.momentum_threshold}%")
+    if momentum.use_momentum_exit:
+        header += f" exit<={momentum.exit_threshold}%"
+    header += "） ==="
+    if args.source == "mt5" and args.spread is None:
+        header += " ※実スプレッド込み"
+    print(header)
+
+    trades = run_currency_momentum(dfs, momentum, cfg.atr_period, spreads)
+    s = summarize(trades)
+    pf = f"{s.pf:.2f}" if s.pf != float("inf") else "∞"
+    lo = min((df["time"].min() for df in dfs.values()))
+    hi = max((df["time"].max() for df in dfs.values()))
+    span = (f" / 実データ {pd.Timestamp(lo).strftime('%Y-%m-%d')}"
+            f"〜{pd.Timestamp(hi).strftime('%Y-%m-%d')}")
+    print(f"  件数 {s.n:4d}  勝率 {s.win_rate:5.1%}  平均R {s.avg_r:+6.3f}  PF {pf}  "
+          f"合計R {s.total_r:+8.1f}  平均保有 {s.avg_bars:.1f}足{span}")
+    if s.total_cost:
+        print(f"  スプレッド控除: 合計 {s.total_cost:.2f}R（1トレード平均 {s.total_cost / s.n:.3f}R）")
+    print(f"  決済理由: " + (", ".join(f"{k}={v}" for k, v in sorted(s.by_reason.items())) or "-"))
+    # 銘柄別の内訳（合計R 降順）
+    per_sym = {sym: [t for t in trades if t.symbol == sym] for sym in dfs}
+    for sym, tt in sorted(per_sym.items(),
+                          key=lambda kv: summarize(kv[1]).total_r, reverse=True):
+        ss = summarize(tt)
+        print(f"      {sym:<8} 件数 {ss.n:4d}  平均R {ss.avg_r:+6.3f}  合計R {ss.total_r:+8.1f}")
+
+    save_trades(trades, args.out)
+    return trades
+
+
 def main(argv=None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     parser = argparse.ArgumentParser(description="MT5 bot のバックテスター")
@@ -807,6 +1024,16 @@ def main(argv=None) -> None:
                         help="box-sweep する SL バッファ（ATR 倍数）のカンマ区切りリスト")
     parser.add_argument("--box-no-bb", action="store_true",
                         help="box-sweep で BB 幅フィルタを無効にする（全 combo 共通）")
+    parser.add_argument("--momentum", action="store_true",
+                        help="通貨強弱（相対モメンタム）戦略を全銘柄横断で検証")
+    parser.add_argument("--momentum-lookback", type=int, default=None,
+                        help="変化率の算出期間（本数）。省略時は config.momentum_lookback")
+    parser.add_argument("--momentum-threshold", type=float, default=None,
+                        help="最強/最弱ペアの最低スコア差（％）。省略時は config 値")
+    parser.add_argument("--momentum-exit-threshold", type=float, default=None,
+                        help="保有中クローズのスコア差（％）。省略時は config 値")
+    parser.add_argument("--momentum-no-exit", action="store_true",
+                        help="ランキング崩れ/スコア差縮小でのクローズを無効化（TP/SL のみ）")
     parser.add_argument("--sweep-tp", default="2.0,3.0,4.0,5.0",
                         help="スイープする TP（ATR倍数）のカンマ区切りリスト")
     parser.add_argument("--sweep-sl", default="2.0",
@@ -869,6 +1096,17 @@ def main(argv=None) -> None:
     if args.box_sweep:
         try:
             _run_box_sweep(args, broker, cfg, symbols, start, end)
+        finally:
+            if broker is not None:
+                broker.disconnect()
+        return
+
+    if args.momentum:
+        # 通貨強弱戦略は単一銘柄ループではなく全銘柄横断で処理する（FX7ペアに限定）
+        momentum_symbols = [s for s in symbols if s in PAIRS]
+        log.info("通貨強弱（相対モメンタム）戦略で検証します（%d ペア）", len(momentum_symbols))
+        try:
+            _run_momentum(args, broker, cfg, momentum_symbols, start, end)
         finally:
             if broker is not None:
                 broker.disconnect()

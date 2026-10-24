@@ -88,6 +88,7 @@ class Trade:
     exit_reason: str        # "TP" / "SL" / "REVERSAL" / "EOD"
     bars: int               # 保有足数
     cost_r: float = 0.0     # 控除したスプレッドコスト（R 換算）
+    swap_r: float = 0.0     # 控除したスワップ（R 換算、正＝受取で改善、負＝支払）
 
 
 @dataclass
@@ -755,6 +756,180 @@ def run_pair_filter(main_df: pd.DataFrame, comp_dfs: dict, trend_strategy,
     return trades
 
 
+def run_squeeze_breakout(df: pd.DataFrame, symbol: str,
+                         squeeze_mult: float = 0.7,
+                         squeeze_lookback: int = 100,
+                         atr_period: int = 14,
+                         channel_window: int = 20,
+                         trail_window: int = 10,
+                         init_sl_atr: float = 2.0,
+                         spread_price: float = 0.0,
+                         swap_r_per_day: float = 0.0) -> List[Trade]:
+    """ボラティリティ収縮→拡散（スクイーズブレイクアウト）順張り戦略（アイディア3）。
+
+    - スクイーズ: 現在ATR < squeeze_mult × 直近 squeeze_lookback 本のATR平均（＝収縮）。
+      判定は shift(1) で「前足までの確定データ」に揃え、見通しバイアスを避ける。
+    - エントリー: 直近 channel_window 本の高値/安値（shift(1)）を、終値がブレイクした
+      方向へ順張り。スクイーズ状態のときだけ出る。
+    - 決済（トレイリング）: 初期SL（init_sl_atr×ATR）を下限に、N期（trail_window）の
+      安値割れ（ロング）/高値抜け（ショート）で追従し、TPは置かず伸ばす。
+      追従ストップは「逆行に動かない」よう単調ラチェット。約定はギャップ時 open 補正。
+    - スワップ: swap_r_per_day（R/日、正＝受取）を保有日数分 R で控除/加算。
+      デフォルト 0。実運用判定の前に実スワップを必ず突っ込むこと。
+
+    ファットテール戦略のため、判定は summarize() の総PFだけでは不足。
+    必ず fat_tail_report() で裾分布・ビッグトレンド除去感度を見る。
+    """
+    n = len(df)
+    warmup = max(atr_period, squeeze_lookback, channel_window, trail_window, 2) + 2
+    if n <= warmup:
+        return []
+
+    close = df["close"].to_numpy()
+    high = df["high"].to_numpy()
+    low = df["low"].to_numpy()
+    opn = df["open"].to_numpy()
+    times = df["time"].to_numpy()
+
+    atr = compute_atr(df, atr_period).to_numpy()
+    atr_ma = pd.Series(atr).rolling(squeeze_lookback).mean().to_numpy()
+    squeeze = atr < squeeze_mult * atr_ma          # 収縮の生フラグ
+    squeeze_ready = np.roll(squeeze, 1)            # 前足までの確定で判定（i=0 は捨てる）
+    squeeze_ready[0] = False
+
+    ch_high = pd.Series(high).rolling(channel_window).max().shift(1).to_numpy()
+    ch_low = pd.Series(low).rolling(channel_window).min().shift(1).to_numpy()
+    trail_low = pd.Series(low).rolling(trail_window).min().shift(1).to_numpy()
+    trail_high = pd.Series(high).rolling(trail_window).max().shift(1).to_numpy()
+
+    pos = None  # dict(direction, entry, denom, stop, entry_time, entry_index)
+    trades: List[Trade] = []
+
+    def _fill_long_stop(stop_px, o):
+        # ロングの損切り約定＝売り。不利側＝より安い方で約定。
+        return o if o <= stop_px else stop_px
+
+    def _fill_short_stop(stop_px, o):
+        # ショートの損切り約定＝買い戻し。不利側＝より高い方で約定。
+        return o if o >= stop_px else stop_px
+
+    def _emit(p, i, exit_px, reason):
+        dist = (exit_px - p["entry"]) * p["direction"]
+        gross_r = dist / p["denom"]
+        cost_r = spread_price / p["denom"] if spread_price and p["denom"] > 0 else 0.0
+        dt = pd.Timestamp(times[i]) - pd.Timestamp(p["entry_time"])
+        days = dt.total_seconds() / 86400.0
+        swap_r = swap_r_per_day * days
+        r = gross_r - cost_r + swap_r
+        t = Trade(
+            symbol=symbol,
+            direction="buy" if p["direction"] == 1 else "sell",
+            strategy="squeeze_breakout", regime="trend",
+            entry_time=pd.Timestamp(p["entry_time"]),
+            exit_time=pd.Timestamp(times[i]),
+            entry=float(p["entry"]), exit=float(exit_px),
+            sl_distance=float(p["denom"]), r=float(r), exit_reason=reason,
+            bars=i - p["entry_index"], cost_r=float(cost_r), swap_r=float(swap_r),
+        )
+        trades.append(t)
+
+    for i in range(warmup, n):
+        if pos is None:
+            if not squeeze_ready[i]:
+                continue
+            if close[i] > ch_high[i] and np.isfinite(ch_high[i]):
+                direction = 1
+                entry = close[i]
+                stop = entry - init_sl_atr * atr[i]
+            elif close[i] < ch_low[i] and np.isfinite(ch_low[i]):
+                direction = -1
+                entry = close[i]
+                stop = entry + init_sl_atr * atr[i]
+            else:
+                continue
+            if not np.isfinite(atr[i]) or atr[i] <= 0:
+                continue
+            pos = dict(direction=direction, entry=entry, denom=init_sl_atr * atr[i],
+                       stop=stop, entry_time=times[i], entry_index=i)
+        else:
+            d = pos["direction"]
+            if d == 1:
+                # トレイリング: 直近N本の安値で下限を引き上げ（単調ラチェット）
+                if np.isfinite(trail_low[i]) and trail_low[i] > pos["stop"]:
+                    pos["stop"] = trail_low[i]
+                if low[i] <= pos["stop"]:
+                    _emit(pos, i, _fill_long_stop(pos["stop"], opn[i]), "SL")
+                    pos = None
+                    continue
+            else:
+                if np.isfinite(trail_high[i]) and trail_high[i] < pos["stop"]:
+                    pos["stop"] = trail_high[i]
+                if high[i] >= pos["stop"]:
+                    _emit(pos, i, _fill_short_stop(pos["stop"], opn[i]), "SL")
+                    pos = None
+                    continue
+
+    if pos is not None:
+        last = df.iloc[-1]
+        _emit(pos, n - 1, float(last["close"]), "EOD")
+
+    return trades
+
+
+def fat_tail_report(trades: List[Trade], label: str = "") -> None:
+    """ファットテール戦略の判定用レポート（アイディア3）。
+
+    少数のビッグトレンドに依存する戦略は summarize() の総PFだけでは運とエッジを
+    区別できない。上位 k 勝の寄与率・上位を除去した感度・R の裾分布を出す。
+    """
+    if not trades:
+        print(f"  [{label}] トレードなし")
+        return
+    r = np.array([t.r for t in trades])
+    wins = r[r > 0]
+    total = r.sum()
+    s = summarize(trades)
+    pf = f"{s.pf:.2f}" if s.pf != float("inf") else "∞"
+    print(f"  [{label}] 件数 {s.n}  勝率 {s.win_rate:.1%}  合計R {total:+.1f}  "
+          f"平均R {s.avg_r:+.3f}  PF {pf}  maxDD {s.max_dd:.1f}R")
+
+    if len(wins) == 0:
+        print(f"  [{label}] 勝ちトレードなし（全損）")
+        return
+
+    top_k = min(5, len(wins))
+    sorted_wins = np.sort(wins)[::-1]
+    top_contrib = sorted_wins[:top_k].sum()
+    gross_profit = wins.sum()
+    print(f"  [{label}] 上位{top_k}勝の寄与: {top_contrib:+.1f}R / 総利益 {gross_profit:+.1f}R "
+          f"= {top_contrib / gross_profit:.0%}")
+
+    # 上位 k 勝を除去した感度（ビッグトレンド＝運 を除いた残りが勝てるか）
+    rest = r.copy()
+    for _ in range(top_k):
+        idx = int(np.argmax(rest))
+        rest[idx] = np.nan
+    rest = rest[np.isfinite(rest)]
+    if len(rest):
+        rest_r = rest.sum()
+        rest_wins = rest[rest > 0]
+        rest_loss = abs(rest[rest <= 0].sum())
+        rest_pf = rest_wins.sum() / rest_loss if rest_loss > 0 else float("inf")
+        rest_pf_s = f"{rest_pf:.2f}" if rest_pf != float("inf") else "∞"
+        print(f"  [{label}] 上位{top_k}勝除去後: 件数 {len(rest)}  合計R {rest_r:+.1f}  "
+              f"平均R {rest_r / len(rest):+.3f}  PF {rest_pf_s}")
+
+    # R の裾分布（勝ち側の分布形状 = ファットテールか一様か）
+    edges = [1.0, 2.0, 3.0, 5.0, 10.0]
+    labels = ["<1R", "1-2R", "2-3R", "3-5R", "5-10R", ">=10R"]
+    bins = [0] + edges + [float("inf")]
+    counts = [int(((wins > bins[k]) & (wins <= bins[k + 1])).sum()) for k in range(len(labels))]
+    contribs = [float(wins[(wins > bins[k]) & (wins <= bins[k + 1])].sum())
+                for k in range(len(labels))]
+    dist = "  ".join(f"{l}:{c}件({v:+.1f}R)" for l, c, v in zip(labels, counts, contribs))
+    print(f"  [{label}] 勝ちR分布: {dist}")
+
+
 # ---------- 出力 ----------
 
 def print_summary(symbol: str, s: Summary, span: str = None) -> None:
@@ -1147,6 +1322,112 @@ def _run_pair_filter(args, broker, cfg, symbols, start=None, end=None) -> List[T
     return filt
 
 
+def _run_squeeze(args, broker, cfg, symbols, start=None, end=None) -> List[Trade]:
+    """ボラ収縮→拡散（スクイーズブレイク）戦略の検証。
+
+    - 対象は symbols（--symbol で1銘柄、省略時は config の全銘柄）。
+    - グロス/ネットを分離するため --spread 0 も併走し、fat_tail_report() で裾分布を出す。
+    - スワップは --swap-r-per-day で投入（デフォルト0）。実運用判定には実値を必ず指定。
+    """
+    all_trades: List[Trade] = []
+    for sym in symbols:
+        df = _fetch_df(args, broker, sym, start, end, timeframe=cfg.timeframe)
+        if df is None or len(df) < 60:
+            log.warning("履歴なし/不足: %s（%s 本）", sym, 0 if df is None else len(df))
+            continue
+        spread_price = _spread_for(args, broker, sym, cfg) if args.spread is None else args.spread
+
+        span = f" / 実データ {_span_of(df)}"
+        note = " ※実スプレッド込み" if (args.source == "mt5" and args.spread is None) else ""
+        print(f"=== squeeze [{sym} × mult={args.squeeze_mult} lk={args.squeeze_lookback} "
+              f"ch={args.squeeze_channel} trail={args.squeeze_trail} initSL={args.squeeze_init_sl}ATR]"
+              f"（{cfg.timeframe}{span}）{note} ===")
+
+        # ネット（実スプレッド）と、グロス分離（--spread 0）を両方算出
+        net_trades = run_squeeze_breakout(
+            df, sym,
+            squeeze_mult=args.squeeze_mult,
+            squeeze_lookback=args.squeeze_lookback,
+            atr_period=cfg.atr_period,
+            channel_window=args.squeeze_channel,
+            trail_window=args.squeeze_trail,
+            init_sl_atr=args.squeeze_init_sl,
+            spread_price=spread_price,
+            swap_r_per_day=args.swap_r_per_day,
+        )
+        gross_trades = run_squeeze_breakout(
+            df, sym,
+            squeeze_mult=args.squeeze_mult,
+            squeeze_lookback=args.squeeze_lookback,
+            atr_period=cfg.atr_period,
+            channel_window=args.squeeze_channel,
+            trail_window=args.squeeze_trail,
+            init_sl_atr=args.squeeze_init_sl,
+            spread_price=0.0,
+            swap_r_per_day=args.swap_r_per_day,
+        )
+
+        fat_tail_report(gross_trades, label=f"{sym} グロス")
+        fat_tail_report(net_trades, label=f"{sym} ネット")
+
+        ns = summarize(net_trades)
+        if ns.n and (spread_price or args.swap_r_per_day):
+            print(f"  [{sym}] コスト内訳: スプレッド合計 {ns.total_cost:.2f}R / スワップ合計 "
+                  f"{sum(t.swap_r for t in net_trades):.2f}R")
+
+        all_trades.extend(net_trades)
+    return all_trades
+
+
+def _run_squeeze_sweep(args, broker, cfg, symbols, start=None, end=None) -> List[Trade]:
+    """スクイーズ戦略のパラメータ総当たり（mult × trail）。
+
+    - 既存4戦略の判定基準に合わせ、グロス（--spread 0）で「連続プラス高原」が出るかを測る。
+      ネットは別途単発（--squeeze）で fat_tail_report を見る。
+    - 出力は mult × trail の格子。銘柄は --symbol 指定推奨（高速化）。
+    """
+    mults = _parse_csv_floats(args.squeeze_mults)
+    trails = _parse_csv_ints(args.squeeze_trails)
+    dfs, spreads = {}, {}
+    for sym in symbols:
+        df = _fetch_df(args, broker, sym, start, end, timeframe=cfg.timeframe)
+        if df is None or len(df) < 60:
+            log.warning("履歴なし/不足: %s（%s 本）", sym, 0 if df is None else len(df))
+            continue
+        dfs[sym] = df
+        spreads[sym] = _spread_for(args, broker, sym, cfg) if args.spread is None else args.spread
+    if not dfs:
+        return []
+
+    span = f" / 実データ {min(df['time'].min() for df in dfs.values())}〜{max(df['time'].max() for df in dfs.values())}"
+    print(f"=== squeeze-sweep [mult × trail]（{cfg.timeframe} / {len(dfs)}銘柄合算{span} "
+          f"/ ch={args.squeeze_channel} lk={args.squeeze_lookback} initSL={args.squeeze_init_sl}ATR） ===")
+
+    all_trades: List[Trade] = []
+    for mult in mults:
+        for trail in trails:
+            combo: List[Trade] = []
+            for sym, df in dfs.items():
+                tt = run_squeeze_breakout(
+                    df, sym,
+                    squeeze_mult=mult,
+                    squeeze_lookback=args.squeeze_lookback,
+                    atr_period=cfg.atr_period,
+                    channel_window=args.squeeze_channel,
+                    trail_window=trail,
+                    init_sl_atr=args.squeeze_init_sl,
+                    spread_price=0.0,          # グロスで測る
+                    swap_r_per_day=0.0,
+                )
+                combo.extend(tt)
+            s = summarize(combo)
+            pf = f"{s.pf:.2f}" if s.pf != float("inf") else "∞"
+            print(f"  mult={mult:.1f} trail={trail:2d}  件数 {s.n:4d}  勝率 {s.win_rate:5.1%}  "
+                  f"平均R {s.avg_r:+6.3f}  PF {pf}  合計R {s.total_r:+8.1f}")
+            all_trades.extend(combo)
+    return all_trades
+
+
 def main(argv=None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     parser = argparse.ArgumentParser(description="MT5 bot のバックテスター")
@@ -1193,6 +1474,26 @@ def main(argv=None) -> None:
                         help="pair-filter の構成要素（カンマ区切り）。主銘柄の両脇のクロス分解に一致させる")
     parser.add_argument("--pair-ema", type=int, default=200,
                         help="pair-filter の構成要素側 EMA 期間（price との位置判定）")
+    parser.add_argument("--squeeze", action="store_true",
+                        help="ボラ収縮→拡散（スクイーズブレイクアウト）順張り戦略を検証")
+    parser.add_argument("--squeeze-mult", type=float, default=0.7,
+                        help="スクイーズ判定: 現在ATR < mult × 直近lookback本のATR平均")
+    parser.add_argument("--squeeze-lookback", type=int, default=100,
+                        help="スクイーズ判定のATR平均を取る直近本数")
+    parser.add_argument("--squeeze-channel", type=int, default=20,
+                        help="ブレイク対象の高安値チャネル期間")
+    parser.add_argument("--squeeze-trail", type=int, default=10,
+                        help="トレイリングストップのN期高安値")
+    parser.add_argument("--squeeze-init-sl", type=float, default=2.0,
+                        help="初期SL幅（ATR倍数）")
+    parser.add_argument("--swap-r-per-day", type=float, default=0.0,
+                        help="スワップ（R/日、正=受取、負=支払）。実値投入で保有日数分控除")
+    parser.add_argument("--squeeze-sweep", action="store_true",
+                        help="スクイーズ戦略のパラメータ総当たり（mult × trail、グロスのみ合算）")
+    parser.add_argument("--squeeze-mults", default="0.4,0.5,0.6,0.7,0.8",
+                        help="squeeze-sweep するスクイーズ閾値（ATR 比）のカンマ区切り")
+    parser.add_argument("--squeeze-trails", default="5,10,20,40",
+                        help="squeeze-sweep するトレイリングN期のカンマ区切り")
     parser.add_argument("--sweep-tp", default="2.0,3.0,4.0,5.0",
                         help="スイープする TP（ATR倍数）のカンマ区切りリスト")
     parser.add_argument("--sweep-sl", default="2.0",
@@ -1274,6 +1575,24 @@ def main(argv=None) -> None:
     if args.pair_filter:
         try:
             all_trades = _run_pair_filter(args, broker, cfg, symbols, start, end)
+        finally:
+            if broker is not None:
+                broker.disconnect()
+        save_trades(all_trades, args.out)
+        return
+
+    if args.squeeze:
+        try:
+            all_trades = _run_squeeze(args, broker, cfg, symbols, start, end)
+        finally:
+            if broker is not None:
+                broker.disconnect()
+        save_trades(all_trades, args.out)
+        return
+
+    if args.squeeze_sweep:
+        try:
+            all_trades = _run_squeeze_sweep(args, broker, cfg, symbols, start, end)
         finally:
             if broker is not None:
                 broker.disconnect()

@@ -668,6 +668,93 @@ def run_currency_momentum(dfs, momentum: CurrencyMomentumStrategy,
     return trades
 
 
+def run_pair_filter(main_df: pd.DataFrame, comp_dfs: dict, trend_strategy,
+                    comp_ema_span: int = 200, atr_period: int = 14,
+                    spread_price: float = 0.0) -> List[Trade]:
+    """合成通貨フィルタ付きトレンド戦略（アイディア2）。
+
+    主銘柄（GBPJPY）の EMA クロスシグナルを、構成要素（GBPUSD / USDJPY）の
+    「price と EMA(comp_ema_span) の位置」が同方向（GBPJPY 買い = 両方 price>EMA、
+    売り = 両方 price<EMA）に一致したときだけ取引する。
+
+    GBPJPY = GBPUSD × USDJPY の構成要素分解に基づき、「GBP高かつ円安（買い）」または
+    「GBP安かつ円高（売り）」という資金フローが揃った状態だけを切り出すためのゲート。
+
+    - 主銘柄の信号・ATR・SL/TP は既存 EMACrossStrategy をそのまま使う（_Indicators で前計算）。
+    - 構成要素の EMA 状態は「主銘柄の足時点で確定済みの最新足」で判定（見通しバイアス回避）。
+    - 逆シグナルかつフィルタ透過でドテン、末尾で EOD 決済。レジームは TREND 固定
+      （既存 run() の force_regime="trend" 相当、比較軸は GBPJPY 単体の trend 固定）。
+    """
+    warmup = max(getattr(trend_strategy, "min_history", 0), atr_period, comp_ema_span) + 2
+    n = len(main_df)
+    if n <= warmup:
+        return []
+
+    ind = _Indicators(main_df, trend_strategy, _HoldStrategy(), atr_period, atr_period)
+
+    # 構成要素ごとに「price > EMA(comp_ema_span)」の真偽を前計算（確定足のみ）。
+    comp_state = {}
+    for sym, df in comp_dfs.items():
+        close = df["close"]
+        ema = close.ewm(span=comp_ema_span, adjust=False).mean().to_numpy()
+        up = close.to_numpy() > ema
+        comp_state[sym] = (pd.DatetimeIndex(df["time"]), up)
+
+    def _gate_ok(t_i, direction: int) -> bool:
+        """direction=+1 なら全構成要素が price>EMA、-1 なら全 price<EMA。"""
+        if comp_state is None:
+            return False
+        for _sym, (times, up) in comp_state.items():
+            idx = times.searchsorted(t_i, side="right") - 1
+            if idx < 0:
+                return False
+            if up[idx] != (direction == 1):
+                return False
+        return True
+
+    def _sig(i: int) -> Signal:
+        return _ema_signal(ind, i, trend_strategy)
+
+    pos: Optional[_Pos] = None
+    trades: List[Trade] = []
+
+    for i in range(warmup, n):
+        bar = main_df.iloc[i]
+        t_i = bar["time"]
+
+        if pos is None:
+            s = _sig(i)
+            direction = 1 if s == Signal.BUY else (-1 if s == Signal.SELL else 0)
+            if direction != 0 and _gate_ok(t_i, direction) and ind.atr[i] > 0:
+                pos = _open(bar, direction, float(ind.atr[i]), trend_strategy,
+                            Regime.TREND, i)
+        else:
+            exit_px, reason = _check_stops(pos, bar)
+            if reason is not None:
+                trades.append(_close(pos, bar, exit_px, reason, i, spread_price))
+                pos = None
+                continue
+
+            s = _sig(i)
+            reverse = (
+                (pos.direction == 1 and s == Signal.SELL)
+                or (pos.direction == -1 and s == Signal.BUY)
+            )
+            if reverse and _gate_ok(t_i, -pos.direction):
+                trades.append(_close(pos, bar, bar["close"], "REVERSAL", i, spread_price))
+                if ind.atr[i] > 0:
+                    pos = _open(bar, -pos.direction, float(ind.atr[i]),
+                                trend_strategy, Regime.TREND, i)
+
+    if pos is not None:
+        last = main_df.iloc[-1]
+        trades.append(_close(pos, last, last["close"], "EOD", n - 1, spread_price))
+
+    for t in trades:
+        t.symbol = "GBPJPY"
+    return trades
+
+
 # ---------- 出力 ----------
 
 def print_summary(symbol: str, s: Summary, span: str = None) -> None:
@@ -996,6 +1083,70 @@ def _run_momentum(args, broker, cfg, symbols, start=None, end=None) -> List[Trad
     return trades
 
 
+def _run_pair_filter(args, broker, cfg, symbols, start=None, end=None) -> List[Trade]:
+    """合成通貨フィルタ（アイディア2）の検証。
+
+    - ベースライン: 主銘柄（GBPJPY）単体の EMA トレンド戦略（trend 固定）
+    - フィルタ付き: 同一シグナルに構成要素（GBPUSD/USDJPY）の EMA 方向一致をゲート適用
+    両者を同一データで出し、スプレッド控除込みで件数・勝率・平均R・PF を比較する。
+    """
+    main = args.pair_main
+    comps = [s.strip() for s in args.pair_components.split(",") if s.strip()]
+
+    def _need(sym):
+        if args.symbol and sym != args.symbol and sym != main and sym not in comps:
+            return False
+        return True
+
+    fetch = {s: None for s in [main] + comps}
+    spreads = {}
+    for s in fetch:
+        if not _need(s):
+            continue
+        df = _fetch_df(args, broker, s, start, end, timeframe=cfg.timeframe)
+        if df is None or len(df) < 60:
+            log.warning("履歴なし/不足: %s（%s 本）→ pair-filter を実行できません",
+                        s, 0 if df is None else len(df))
+            return []
+        fetch[s] = df
+        spreads[s] = _spread_for(args, broker, s, cfg)
+
+    main_df = fetch[main]
+    comp_dfs = {s: fetch[s] for s in comps}
+    if not comp_dfs:
+        log.error("pair-filter には構成要素（--pair-components）が1つ以上必要です")
+        return []
+
+    trend, _ = build_strategies(cfg)   # EMA クロス（trend）のみ使う
+    span = f" / 実データ {_span_of(main_df)}"
+
+    print(f"=== pair-filter [{main} × ({','.join(comps)}) EMA{args.pair_ema}]"
+          f"（{cfg.timeframe}{span}） ===")
+    if args.source == "mt5" and args.spread is None:
+        print("  ※実スプレッド込み")
+
+    # ベースライン: GBPJPY 単体 trend 固定（フィルタなし）
+    base = run(main_df, main, trend, _HoldStrategy(),
+               cfg.adx_period, cfg.adx_threshold, cfg.atr_period,
+               spread_price=spreads[main], force_regime="trend")
+    bs = summarize(base)
+    print(f"  [基準] {main} 単体 EMA       件数 {bs.n:4d}  勝率 {bs.win_rate:5.1%}  "
+          f"平均R {bs.avg_r:+6.3f}  PF {bs.pf:.2f}  合計R {bs.total_r:+8.1f}")
+
+    # フィルタ付き
+    filt = run_pair_filter(main_df, comp_dfs, trend,
+                           comp_ema_span=args.pair_ema,
+                           atr_period=cfg.atr_period,
+                           spread_price=spreads[main])
+    fs = summarize(filt)
+    print(f"  [F] {main} × 構成要素 EMA一致  件数 {fs.n:4d}  勝率 {fs.win_rate:5.1%}  "
+          f"平均R {fs.avg_r:+6.3f}  PF {fs.pf:.2f}  合計R {fs.total_r:+8.1f}")
+
+    print(f"  → 差分（F−基準）: 平均R {fs.avg_r - bs.avg_r:+.3f}  "
+          f"勝率 {fs.win_rate - bs.win_rate:+.1%}  件数 {fs.n - bs.n:+d}")
+    return filt
+
+
 def main(argv=None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     parser = argparse.ArgumentParser(description="MT5 bot のバックテスター")
@@ -1034,6 +1185,14 @@ def main(argv=None) -> None:
                         help="保有中クローズのスコア差（％）。省略時は config 値")
     parser.add_argument("--momentum-no-exit", action="store_true",
                         help="ランキング崩れ/スコア差縮小でのクローズを無効化（TP/SL のみ）")
+    parser.add_argument("--pair-filter", action="store_true",
+                        help="合成通貨フィルタ（GBPJPY×GBPUSD/USDJPYのEMA方向一致）付きトレンド戦略を検証")
+    parser.add_argument("--pair-main", default="GBPJPY",
+                        help="pair-filter の主銘柄（構成要素を参照して取引する側）")
+    parser.add_argument("--pair-components", default="GBPUSD,USDJPY",
+                        help="pair-filter の構成要素（カンマ区切り）。主銘柄の両脇のクロス分解に一致させる")
+    parser.add_argument("--pair-ema", type=int, default=200,
+                        help="pair-filter の構成要素側 EMA 期間（price との位置判定）")
     parser.add_argument("--sweep-tp", default="2.0,3.0,4.0,5.0",
                         help="スイープする TP（ATR倍数）のカンマ区切りリスト")
     parser.add_argument("--sweep-sl", default="2.0",
@@ -1110,6 +1269,15 @@ def main(argv=None) -> None:
         finally:
             if broker is not None:
                 broker.disconnect()
+        return
+
+    if args.pair_filter:
+        try:
+            all_trades = _run_pair_filter(args, broker, cfg, symbols, start, end)
+        finally:
+            if broker is not None:
+                broker.disconnect()
+        save_trades(all_trades, args.out)
         return
 
     all_trades: List[Trade] = []
